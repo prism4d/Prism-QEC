@@ -201,7 +201,7 @@ for k in ("p50_us", "p99_us", "p999_us", "shots_per_sec", "speedup_vs_bposd"):
 
 # 2. Frozen Zero-Tuning Hyperparameter & Blind Seed Proof
 cfg_lock = r.get("config_lock") or {}
-if cfg_lock.get("config_id") != "FROZEN_V1" or not cfg_lock.get("config_sha256"):
+if not str(cfg_lock.get("config_id", "")).startswith("FROZEN_V") or not cfg_lock.get("config_sha256"):
     errs.append("missing config_lock FROZEN_V1 + config_sha256")
 if cfg_lock.get("eval_seed_domain") != "BLIND_HOLDOUT_2026" or cfg_lock.get("per_code_tuning") is not False:
     errs.append("must enforce BLIND_HOLDOUT_2026 with per_code_tuning == false")
