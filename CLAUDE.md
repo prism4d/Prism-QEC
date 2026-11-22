@@ -17,3 +17,6 @@
 
 ## 1. Scientific & Systems Architecture
 Read `docs/PRISM_QEC_ARCHITECTURE.md` in full before writing code. All four innovations must be implemented genuinely and verified against `Stim` circuit-level Bivariate Bicycle codes (`[[72, 12, 6]]` and `[[144, 12, 12]]` Gross code) and head-to-head `BP-OSD` / `BP-LSD` baselines from `/mnt/storage/prism-qec/.venv/bin/python`.
+
+## 2. Commercial SOTA Proof Bar (`docs/QEC_COMMERCIAL_SOTA_PROTOCOL.md` — MANDATORY)
+- Read `docs/QEC_COMMERCIAL_SOTA_PROTOCOL.md` in full. 2,000-shot runs, single-code tuning, `BB72` fast-path false-convergence regressions, unmeasured "in progress" `qec-neuro-dem` claims, and unstamped Gates 0..4 are **MECHANICALLY BLOCKED** by `stop_gate_auditor.py` and `qec-ctl.sh verify-gate 4`.

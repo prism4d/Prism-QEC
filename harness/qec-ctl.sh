@@ -184,13 +184,77 @@ case "$cmd" in
         python3 - "$RECEIPT" "$SEAL" <<'PY'
 import json, sys
 from pathlib import Path
+
 r = json.loads(Path(sys.argv[1]).read_text())
 s = json.loads(Path(sys.argv[2]).read_text())
-assert r.get("green_ctx_sms") == [28, 56], f"green_ctx_sms={r.get('green_ctx_sms')} != [28, 56]"
-assert r.get("host_syncs_in_decode_loop") == 0, "host_syncs_in_decode_loop != 0"
-assert "bb144_gross" in json.dumps(r).lower(), "Missing [[144,12,12]] Gross code results"
-assert len(s.get("merkle_root_sha256", "")) == 64 and len(s.get("merkle_root_blake3", "")) == 64, "Invalid dual Merkle roots"
-print("[GATE-4 RECEIPT & DUAL MERKLE SEAL VERIFIED]")
+
+errs = []
+# 1. Hardware & Persistent SM120 Graph Proof
+if r.get("green_ctx_sms") != [28, 56]:
+    errs.append(f"green_ctx_sms={r.get('green_ctx_sms')} != [28, 56]")
+if r.get("host_syncs_in_decode_loop") != 0:
+    errs.append("host_syncs_in_decode_loop != 0")
+gpu_tel = r.get("gpu_sm120_telemetry") or {}
+for k in ("p50_us", "p99_us", "p999_us", "shots_per_sec", "speedup_vs_bposd"):
+    if not isinstance(gpu_tel.get(k), (int, float)) or gpu_tel[k] <= 0:
+        errs.append(f"missing/invalid gpu_sm120_telemetry.{k}")
+
+# 2. Frozen Zero-Tuning Hyperparameter & Blind Seed Proof
+cfg_lock = r.get("config_lock") or {}
+if cfg_lock.get("config_id") != "FROZEN_V1" or not cfg_lock.get("config_sha256"):
+    errs.append("missing config_lock FROZEN_V1 + config_sha256")
+if cfg_lock.get("eval_seed_domain") != "BLIND_HOLDOUT_2026" or cfg_lock.get("per_code_tuning") is not False:
+    errs.append("must enforce BLIND_HOLDOUT_2026 with per_code_tuning == false")
+
+# 3. Multi-Code, Multi-Noise Statistical Power & BB72 Non-Regression
+cells = r.get("stationary_matrix") or []
+codes_seen = {c.get("code_id") for c in cells}
+for req_code in ("bb72", "bb90", "bb144_gross", "surface_d5", "surface_d7", "hgp_hamming"):
+    if req_code not in codes_seen:
+        errs.append(f"stationary_matrix missing required code family '{req_code}'")
+if len(cells) < 18:
+    errs.append(f"stationary_matrix has only {len(cells)} cells (need >= 18 multi-code x multi-p cells)")
+
+for c in cells:
+    cid = f"{c.get('code_id')}@p={c.get('p')}"
+    shots = int(c.get("shots", 0))
+    p_err = int(c.get("prism_errors", -1))
+    o_err = int(c.get("bposd_errors", -1))
+    if shots < 50000:
+        errs.append(f"{cid}: shots={shots} < 50,000 statistical floor")
+    if "clopper_pearson_95" not in c or "mcnemar_p_value" not in c:
+        errs.append(f"{cid}: missing clopper_pearson_95 or paired mcnemar_p_value")
+    if c.get("code_id") == "bb72":
+        fp_wrong = int(c.get("fast_path_false_converged", 999999))
+        if p_err > 0 and fp_wrong > max(3, int(0.12 * p_err)):
+            errs.append(f"{cid}: BB72 fast_path_false_converged={fp_wrong}/{p_err} still regressing")
+        if p_err > o_err and float(c.get("mcnemar_p_value", 0.0)) < 0.05:
+            errs.append(f"{cid}: statistically significant BB72 regression vs BP-OSD ({p_err} vs {o_err})")
+
+# 4. Measured Non-Stationary Neuro-DEM (BOCPD + do-TIDE) & HLE Pareto Frontier
+neuro = r.get("neuro_dem_evaluation") or {}
+for exp_key in ("tls_hot_qubit_dropout", "correlated_crosstalk_and_burst"):
+    ex = neuro.get(exp_key) or {}
+    if int(ex.get("shots", 0)) < 50000:
+        errs.append(f"neuro_dem_evaluation.{exp_key} shots < 50,000")
+    if not (float(ex.get("prism_neuro_on_ler", 1.0)) * 3.0 <= float(ex.get("bposd_static_ler", 0.0))):
+        errs.append(f"neuro_dem_evaluation.{exp_key} failed >=3x LER improvement over static BP-OSD")
+
+hle = r.get("hle_pareto_frontier") or []
+if len(hle) < 4:
+    errs.append("hle_pareto_frontier must report >= 4 abort-rate operating points (0.1%, 0.5%, 1.0%, 2.0%)")
+
+# 5. Dual Merkle Seal
+if len(s.get("merkle_root_sha256", "")) != 64 or len(s.get("merkle_root_blake3", "")) != 64:
+    errs.append("invalid dual SHA-256 + BLAKE3 Merkle roots")
+
+if errs:
+    sys.stderr.write("[GATE-4 COMMERCIAL SOTA AUDIT FAILED]:
+  - " + "
+  - ".join(errs) + "
+")
+    sys.exit(1)
+print("[GATE-4 COMMERCIAL SOTA RECEIPT & DUAL MERKLE SEAL VERIFIED]")
 PY
         ;;
       *)
