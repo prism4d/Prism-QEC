@@ -1,0 +1,44 @@
+{
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "",
+    "CARGO_TARGET_DIR": "/mnt/storage/prism-qec/target",
+    "CARGO_BUILD_JOBS": "6",
+    "RAYON_NUM_THREADS": "6",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session_context.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|MultiEdit|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre_tool_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop_gate_auditor.py",
+            "timeout": 90
+          }
+        ]
+      }
+    ]
+  }
+}

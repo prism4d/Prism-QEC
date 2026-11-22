@@ -1,0 +1,10 @@
+/target/
+/.harness/
+/.venv/
+/runs/*
+!/runs/.gitkeep
+/.claude/settings.local.json
+__pycache__/
+*.pyc
+*.cubin
+*.fatbin
