@@ -31,9 +31,12 @@ pub struct SmcConfig {
     pub seed: u64,
     /// Sweep budget of the zero-temperature quench that centres the twisted reference.
     pub quench_sweeps: u32,
+    /// Reliability-ordered pair exploration: chords considered and pair moves allowed.
+    pub pair_lambda: u32,
+    pub pair_rounds: u32,
     /// Resample when `ESS < W * resample_q8 / 256` (0 = never: plain annealed importance sampling).
     pub resample_q8: u32,
-    /// HLE gap threshold `tau_cert` in nats.
+    /// HLE threshold on the herald risk (see `ShotResult::hle_risk`).
     pub tau_cert: f64,
     /// HLE Pareto threshold.
     pub khat_max: f64,
@@ -48,10 +51,18 @@ impl Default for SmcConfig {
             sweeps: 1,
             seed: 0x5052_4953_4D53_4D43,
             quench_sweeps: 8,
+            pair_lambda: 0,
+            pair_rounds: 0,
             resample_q8: 128,
             tau_cert: 1.0,
             khat_max: 0.7,
         }
+    }
+}
+
+impl SmcConfig {
+    pub fn relax(&self) -> crate::pivot::Relax {
+        crate::pivot::Relax { quench_sweeps: self.quench_sweeps, pair_lambda: self.pair_lambda, pair_rounds: self.pair_rounds }
     }
 }
 
@@ -444,7 +455,7 @@ mod tests {
         let (mut worst_p, mut worst_z, mut agree, mut total) = (0.0f64, 0.0f64, 0, 0);
         for seed in 0..24u64 {
             let (en, syn, post) = instance(g, 0.12, seed);
-            let pivot = build_pivot(g, &en, &post, &syn, cfg.k_cols, cfg.quench_sweeps, &mut scratch);
+            let pivot = build_pivot(g, &en, &post, &syn, cfg.k_cols, cfg.relax(), &mut scratch);
             assert!(pivot.solvable);
             assert_eq!(pivot.n_free(), 10);
             let exact = exact_cosets(&pivot, g.n_obs);
@@ -485,7 +496,7 @@ mod tests {
         let tables = SmcTables::new(cfg.beta_steps);
         let mut scratch = PivotScratch::default();
         let (en, syn, post) = instance(&g, 0.1, 3);
-        let pivot = build_pivot(&g, &en, &post, &syn, cfg.k_cols, cfg.quench_sweeps, &mut scratch);
+        let pivot = build_pivot(&g, &en, &post, &syn, cfg.k_cols, cfg.relax(), &mut scratch);
         let pop = run_walkers(&pivot, &cfg, &tables, 0);
         // determinism: a pure function of (pivot, cfg, shot id)
         assert_eq!(pop, run_walkers(&pivot, &cfg, &tables, 0));

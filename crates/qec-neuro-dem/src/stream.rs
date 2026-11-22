@@ -16,9 +16,24 @@
 //!    A fully depolarised (TLS-dropout) qubit drives that rate to 1/2, i.e. `w = 0`: a known
 //!    erasure.  A dormant correlated-crosstalk hyperedge is activated by the same rule.
 //!    Two-detector mechanisms only receive the rate left unexplained by larger mechanisms.
+//!
+//! From `FROZEN_V2` on, mechanisms with three or more detectors are estimated by the k-point
+//! *coincidence* of their own detector pattern instead of the pairwise rule: a mechanism
+//! *class* is the translation-invariant pattern `(check, layer offset)` of such a mechanism,
+//! and every class counts the samples in which all of its detectors fire together.  Against
+//! the nominal circuit that count is a Poisson likelihood ratio; an active class is
+//! re-weighted to its coincidence rate, minus the rate of the active classes whose pattern
+//! contains it.  This is what resolves simultaneous (space-like) correlated faults such as a
+//! crosstalk hyperedge, whose fifteen detector pairs are individually far too weak.  A
+//! changepoint of the class's checks restarts the counter from the layers of the new regime
+//! (replayed from the history ring) whenever that regime shows the higher rate, so a dropout
+//! is re-weighted the moment the changepoint filter fires.
 
 use crate::bocpd::Bocpd;
-use crate::tide::{bin_index, bump, g_statistic_q16, log_table_q16, pair_masked, pair_rate_q12, total, PairClass};
+use crate::tide::{
+    bin_index, bump, coincidence_bump, coincidence_g_q16, g_statistic_q16, log_table_q16, pair_masked, pair_rate_q12, total,
+    PairClass,
+};
 use anyhow::{ensure, Result};
 use qec_core::dem::Dem;
 use qec_core::fixed::{energy_from_llr, llr_from_prob, PRIOR_CLIP};
@@ -47,6 +62,18 @@ pub struct NeuroConfig {
     /// filters alone (a mechanism whose checks are all HOT has its nominal probability scaled
     /// by the smallest rate multiplier among them).  CPU reference only.
     pub bocpd_only: bool,
+    /// k-point coincidence estimator for the mechanisms with at least three detectors
+    /// (`false`: the pairwise rule of `FROZEN_V1`).
+    pub coincidence: bool,
+    /// Window of the coincidence counters (<= 255 samples): matches and exposure halve there.
+    pub coin_cap: u32,
+    /// Coincidences required before a class with a cold check may become active, and the
+    /// likelihood-ratio threshold (nats) it must reach.
+    pub coin_min: u32,
+    pub g_threshold_coin: u32,
+    /// Erasure snap: a class whose checks are all HOT and whose regime is younger than
+    /// `n_min` samples is a known erasure (`w = 0`) as soon as it is active.
+    pub snap: bool,
 }
 
 impl Default for NeuroConfig {
@@ -62,6 +89,11 @@ impl Default for NeuroConfig {
             mc_blocks: 4096,
             seed: 0x5052_4953_4D4E_4555,
             bocpd_only: false,
+            coincidence: false,
+            coin_cap: 64,
+            coin_min: 2,
+            g_threshold_coin: 24,
+            snap: false,
         }
     }
 }
@@ -98,7 +130,25 @@ pub struct NeuroLayout {
     pub log_q16: Vec<i32>,
     /// `llr_of_p[q] = LLR(q / 4096)` for `q = 0..=2048`.
     pub llr_of_p: Vec<i32>,
+    /// Mechanism classes (empty unless the coincidence estimator is on): the pattern
+    /// `check | layer offset << 12` (sorted) of every mechanism with at least three detectors
+    /// spanning at most two consecutive layers.
+    pub cls_ptr: Vec<u32>,
+    pub cls_det: Vec<u32>,
+    /// Layers spanned by the pattern (1 or 2).
+    pub cls_span: Vec<u8>,
+    /// Nominal coincidence rate per sample (Q32) and its logarithm (Q16 nats).
+    pub cls_pi_q32: Vec<u32>,
+    pub cls_lnpi_q16: Vec<i32>,
+    /// class -> classes whose pattern contains it (one entry per embedding).
+    pub cls_sup_ptr: Vec<u32>,
+    pub cls_sup: Vec<u32>,
+    /// mechanism -> class, or [`NO_CLASS`].
+    pub mech_cls: Vec<u32>,
 }
+
+/// Marks a mechanism that belongs to no class.
+pub const NO_CLASS: u32 = u32::MAX;
 
 fn pair_class(a: (u16, u16), b: (u16, u16)) -> Option<PairClass> {
     let ((ca, la), (cb, lb)) = (a, b);
@@ -116,6 +166,8 @@ fn pair_class(a: (u16, u16), b: (u16, u16)) -> Option<PairClass> {
 impl NeuroLayout {
     pub fn build(dem: &Dem, cfg: &NeuroConfig) -> Result<Self> {
         ensure!(cfg.count_cap >= 16 && cfg.count_cap <= 255, "count_cap must be in [16, 255]");
+        ensure!(cfg.coin_cap >= 8 && cfg.coin_cap <= 255, "coin_cap must be in [8, 255]");
+        ensure!(cfg.coin_min >= 1, "coin_min must be at least 1");
         let mut site = Vec::with_capacity(dem.n_det);
         for (d, c) in dem.det_coords.iter().enumerate() {
             ensure!(!c[0].is_nan() && !c[1].is_nan(), "detector {d} has no (check, layer) coordinates");
@@ -163,6 +215,61 @@ impl NeuroLayout {
             }
             mech_classes.push(classes);
         }
+        // mechanism classes: translation-invariant patterns of the mechanisms with >= 3 detectors
+        let mut mech_pattern: Vec<Option<Vec<u32>>> = vec![None; dem.n_err()];
+        let mut pattern_index: BTreeMap<Vec<u32>, u32> = BTreeMap::new();
+        if cfg.coincidence {
+            ensure!(n_checks < 4096, "class patterns pack at most 4095 check sites");
+            for e in 0..dem.n_err() {
+                let ds = dem.dets(e);
+                let lmin = ds.iter().map(|&d| site[d as usize].1).min().unwrap_or(0);
+                let lmax = ds.iter().map(|&d| site[d as usize].1).max().unwrap_or(0);
+                if ds.len() < 3 || lmax - lmin > 1 {
+                    continue;
+                }
+                let mut pat: Vec<u32> =
+                    ds.iter().map(|&d| site[d as usize].0 as u32 | (((site[d as usize].1 - lmin) as u32) << 12)).collect();
+                pat.sort_unstable();
+                pattern_index.entry(pat.clone()).or_insert(0);
+                mech_pattern[e] = Some(pat);
+            }
+        }
+        let patterns: Vec<Vec<u32>> = pattern_index.keys().cloned().collect();
+        for (i, pat) in patterns.iter().enumerate() {
+            pattern_index.insert(pat.clone(), i as u32);
+        }
+        let mech_cls: Vec<u32> = mech_pattern.iter().map(|p| p.as_ref().map_or(NO_CLASS, |pat| pattern_index[pat])).collect();
+        let cls_span: Vec<u8> = patterns.iter().map(|pat| 1 + pat.iter().any(|&d| d >> 12 != 0) as u8).collect();
+        let mut cls_ptr = vec![0u32];
+        let mut cls_det = Vec::new();
+        for pat in &patterns {
+            cls_det.extend_from_slice(pat);
+            cls_ptr.push(cls_det.len() as u32);
+        }
+        // containment: T is explained by S when T shifted by 0 or 1 layers lies inside S
+        let mut holders: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (j, pat) in patterns.iter().enumerate() {
+            for &d in pat {
+                holders.entry(d).or_default().push(j as u32);
+            }
+        }
+        let mut cls_sup_ptr = vec![0u32];
+        let mut cls_sup = Vec::new();
+        for (k, pat) in patterns.iter().enumerate() {
+            for shift in 0..2u32 {
+                if shift as u8 + cls_span[k] > 2 {
+                    continue;
+                }
+                let moved: Vec<u32> = pat.iter().map(|&d| d + (shift << 12)).collect();
+                for &j in holders.get(&moved[0]).map(Vec::as_slice).unwrap_or(&[]) {
+                    let sup = &patterns[j as usize];
+                    if sup.len() > pat.len() && moved.iter().all(|d| sup.binary_search(d).is_ok()) {
+                        cls_sup.push(j);
+                    }
+                }
+            }
+            cls_sup_ptr.push(cls_sup.len() as u32);
+        }
         let pairs: Vec<PairClass> = class_index.keys().copied().collect();
         for (i, pc) in pairs.iter().enumerate() {
             class_index.insert(*pc, i as u32);
@@ -188,6 +295,7 @@ impl NeuroLayout {
         }
         // interventional reference: the same statistics under the nominal circuit
         let mut nominal = vec![[0u64; 8]; pairs.len()];
+        let mut cls_nominal = vec![[0u64; 2]; patterns.len()];
         for blk in 0..cfg.mc_blocks as u64 {
             let (dets, _) = dem.sample(&dem.probs, cfg.seed, blk);
             let has = |c: u16, l: usize| det_of[l * n_checks + c as usize] != NO_DETECTOR;
@@ -204,7 +312,21 @@ impl NeuroLayout {
                     nominal[i][bin_index(bit(pc.cj, l), bit(pc.cj, l - 1), bit(pc.ci, src))] += 1;
                 }
             }
+            for (k, pat) in patterns.iter().enumerate() {
+                let span = cls_span[k] as usize;
+                for l in span - 1..layers {
+                    let at = |d: u32| ((d & 0xFFF) as u16, l + 1 - span + (d >> 12) as usize);
+                    if pat.iter().all(|&d| has(at(d).0, at(d).1)) {
+                        cls_nominal[k][1] += 1;
+                        cls_nominal[k][0] += pat.iter().all(|&d| bit(at(d).0, at(d).1)) as u64;
+                    }
+                }
+            }
         }
+        // nominal coincidence rate; a pattern never seen in the reference gets half a count
+        let cls_pi: Vec<f64> = cls_nominal.iter().map(|c| (c[0] as f64).max(0.5) / (c[1] as f64).max(1.0)).collect();
+        let cls_pi_q32: Vec<u32> = cls_pi.iter().map(|&p| (p * 4294967296.0).round().clamp(1.0, 4294967295.0) as u32).collect();
+        let cls_lnpi_q16: Vec<i32> = cls_pi.iter().map(|&p| (p.ln() * 65536.0).round() as i32).collect();
         let mut pair_nom_te_q16 = Vec::with_capacity(pairs.len());
         let mut pair_nom_p_q12 = Vec::with_capacity(pairs.len());
         for counts in &nominal {
@@ -262,6 +384,50 @@ impl NeuroLayout {
             p_nom_q12,
             log_q16: log_table_q16(),
             llr_of_p,
+            cls_ptr,
+            cls_det,
+            cls_span,
+            cls_pi_q32,
+            cls_lnpi_q16,
+            cls_sup_ptr,
+            cls_sup,
+            mech_cls,
+        })
+    }
+
+    pub fn n_cls(&self) -> usize {
+        self.cls_span.len()
+    }
+
+    #[inline]
+    pub fn cls_pattern(&self, k: usize) -> &[u32] {
+        &self.cls_det[self.cls_ptr[k] as usize..self.cls_ptr[k + 1] as usize]
+    }
+
+    #[inline]
+    pub fn cls_sups(&self, k: usize) -> &[u32] {
+        &self.cls_sup[self.cls_sup_ptr[k] as usize..self.cls_sup_ptr[k + 1] as usize]
+    }
+
+    /// True iff class `k` can be sampled with its last layer at within-block layer `tl`.
+    #[inline]
+    pub fn cls_sampled(&self, k: usize, tl: usize) -> bool {
+        let span = self.cls_span[k] as usize;
+        tl + 1 >= span
+            && self.cls_pattern(k).iter().all(|&d| {
+                self.det_of[(tl + 1 - span + (d >> 12) as usize) * self.n_checks + (d & 0xFFF) as usize] != NO_DETECTOR
+            })
+    }
+
+    /// True iff every detector of class `k` fired; `last` / `prev` are the check bits of the
+    /// pattern's last layer and of the layer before it.
+    #[inline]
+    pub fn cls_match(&self, k: usize, last: &[u64], prev: &[u64]) -> bool {
+        let two = self.cls_span[k] == 2;
+        self.cls_pattern(k).iter().all(|&d| {
+            let c = (d & 0xFFF) as usize;
+            let row = if two && d >> 12 == 0 { prev } else { last };
+            (row[c >> 6] >> (c & 63)) & 1 == 1
         })
     }
 
@@ -316,6 +482,9 @@ pub struct StreamState {
     trans: Vec<u8>,
     pair_rate: Vec<i32>,
     explained: Vec<i32>,
+    /// `[matches, exposure]` of every mechanism class and its active rate (Q12, 0: inactive).
+    pub cls_cnt: Vec<[u8; 2]>,
+    cls_rate: Vec<i32>,
 }
 
 /// Marks a (check, layer) site without a detector.
@@ -344,6 +513,8 @@ impl StreamState {
             trans: vec![0; layout.n_checks],
             pair_rate: vec![0; layout.pairs.len()],
             explained: vec![0; layout.pairs.len()],
+            cls_cnt: vec![[0u8; 2]; layout.n_cls()],
+            cls_rate: vec![0; layout.n_cls()],
         }
     }
 
@@ -425,6 +596,46 @@ impl StreamState {
                     bump(&mut self.counts[i], bin, cfg.count_cap);
                 }
             }
+            // ---- phase 2b: k-point coincidences of the mechanism classes
+            for k in 0..layout.n_cls() {
+                let (mut r_heat, mut cooled, mut any_hot) = (0usize, false, false);
+                for &d in layout.cls_pattern(k) {
+                    let c = (d & 0xFFF) as usize;
+                    any_hot |= self.hot[c] == 1;
+                    if self.trans[c] > 0 {
+                        if self.hot[c] == 1 {
+                            r_heat = r_heat.max(self.trans[c] as usize);
+                        } else {
+                            cooled = true;
+                        }
+                    }
+                }
+                if cooled && !any_hot {
+                    // the regime of this class ended
+                    self.cls_cnt[k] = [0, 0];
+                }
+                if r_heat > 1 {
+                    // coincidences of the new regime alone, replayed from the history ring;
+                    // adopted when that regime shows the higher rate
+                    let span = layout.cls_span[k] as usize;
+                    let (mut m, mut n) = (0u32, 0u32);
+                    for back in (1..r_heat).rev() {
+                        if back + span - 1 > self.hist_len || !layout.cls_sampled(k, self.hist_layer[self.hist_slot(back)] as usize) {
+                            continue;
+                        }
+                        n += 1;
+                        m += layout.cls_match(k, self.hist_row(back, wc), self.hist_row(back + 1, wc)) as u32;
+                    }
+                    let [m0, n0] = self.cls_cnt[k];
+                    if n > 0 && (n0 == 0 || m * n0 as u32 > m0 as u32 * n) {
+                        self.cls_cnt[k] = [m as u8, n as u8];
+                    }
+                }
+                if layout.cls_sampled(k, l) {
+                    let hit = layout.cls_match(k, &cur, self.hist_row(1, wc));
+                    coincidence_bump(&mut self.cls_cnt[k], hit, cfg.coin_cap);
+                }
+            }
             // ---- phase 3: push the layer into the history ring
             self.hist_head = (self.hist_head + 1) % HISTORY;
             let h = self.hist_head;
@@ -467,11 +678,45 @@ impl StreamState {
             self.explained[i] = 0;
             report.active_pairs += active as u32;
         }
+        for k in 0..layout.n_cls() {
+            let [m, n] = self.cls_cnt[k];
+            let all_hot = layout.cls_pattern(k).iter().all(|&d| self.hot[(d & 0xFFF) as usize] == 1);
+            let g = coincidence_g_q16(m as u32, n as u32, layout.cls_pi_q32[k], layout.cls_lnpi_q16[k], &layout.log_q16);
+            let (thr, need) = if all_hot { (cfg.g_threshold_hot, 1) } else { (cfg.g_threshold_coin, cfg.coin_min) };
+            self.cls_rate[k] = if (m as u32) < need || g < thr as i64 * 65536 {
+                0
+            } else if cfg.snap && all_hot && (n as u32) < cfg.n_min {
+                2048
+            } else {
+                (((m as i32) << 12) / n as i32).min(2048)
+            };
+        }
         for phase in 0..2 {
             for e in 0..layout.n_mech() {
                 let pairs = layout.mech_pairs(e);
                 let big = layout.mech_size[e] >= 3;
                 if pairs.is_empty() || big != (phase == 0) {
+                    continue;
+                }
+                if layout.mech_cls[e] != NO_CLASS {
+                    // k-point rule: own coincidence rate minus the active containing classes
+                    let k = layout.mech_cls[e] as usize;
+                    let mut p = self.cls_rate[k];
+                    for &s in layout.cls_sups(k) {
+                        p -= self.cls_rate[s as usize];
+                    }
+                    let mut llr = layout.llr_nom[e];
+                    if p > layout.p_nom_q12[e] {
+                        llr = llr.min(layout.llr_of_p[p.min(2048) as usize]);
+                        for &pi in pairs {
+                            let slot = &mut self.explained[pi as usize];
+                            *slot = (*slot).max(p);
+                        }
+                    }
+                    self.llr[e] = llr;
+                    self.en[e] = energy_from_llr(llr);
+                    report.modified_mechanisms += (llr != layout.llr_nom[e]) as u32;
+                    report.erased_mechanisms += (llr <= 0) as u32;
                     continue;
                 }
                 let (mut p, mut veto) = (i32::MAX, false);
@@ -522,10 +767,26 @@ mod tests {
     }
 
     fn bench() -> Bench {
+        bench_with(NeuroConfig { mc_blocks: 2048, ..NeuroConfig::default() })
+    }
+
+    /// The `FROZEN_V2` monitor: k-point coincidence estimator with the erasure snap.
+    fn coincidence_cfg() -> NeuroConfig {
+        NeuroConfig {
+            mc_blocks: 8192,
+            coincidence: true,
+            coin_cap: 255,
+            coin_min: 1,
+            g_threshold_coin: 14,
+            snap: true,
+            ..NeuroConfig::default()
+        }
+    }
+
+    fn bench_with(cfg: NeuroConfig) -> Bench {
         let code = bb72().build().unwrap();
         let rounds = 5;
         let (dem, cells) = Dem::phenomenological(&code, rounds, 0.004, 0.004).unwrap();
-        let cfg = NeuroConfig { mc_blocks: 2048, ..NeuroConfig::default() };
         let layout = NeuroLayout::build(&dem, &cfg).unwrap();
         let graph = TannerGraph::from_complex(&ChainComplex::from_dem_cells(&dem, &cells).unwrap());
         let hz_rows = (0..code.hz.rows).map(|r| code.hz.row(r).iter().map(|&q| q as usize).collect()).collect();
@@ -546,6 +807,58 @@ mod tests {
             let k = b.dem.dets(e).len();
             assert_eq!(b.layout.mech_pairs(e).len(), k * (k - 1) / 2);
         }
+    }
+
+    #[test]
+    fn mechanism_classes_tile_the_data_faults() {
+        let b = bench_with(coincidence_cfg());
+        let l = &b.layout;
+        // every data fault flips its three checks in one layer: one class per data qubit
+        assert_eq!(l.n_cls(), b.n);
+        assert!(l.cls_span.iter().all(|&s| s == 1) && l.cls_sup.is_empty());
+        for e in 0..b.dem.n_err() {
+            assert_eq!(l.mech_cls[e] != NO_CLASS, b.dem.dets(e).len() >= 3);
+        }
+        for k in 0..l.n_cls() {
+            assert_eq!(l.cls_pattern(k).len(), 3);
+            // nominal coincidence rate: about the data fault probability, never zero
+            let pi = l.cls_pi_q32[k] as f64 / 4294967296.0;
+            assert!(pi > 5.0e-4 && pi < 2.0e-2, "class {k}: nominal rate {pi}");
+            assert!(l.cls_sampled(k, 0) && l.cls_sampled(k, l.layers - 1));
+        }
+        // the pairwise monitor builds no class tables
+        assert_eq!(bench().layout.n_cls(), 0);
+    }
+
+    /// The coincidence monitor must not pay for its sensitivity on a stationary stream:
+    /// re-weighting stays rare and the decoder fed the live weights is not worse.
+    #[test]
+    fn coincidence_monitor_is_harmless_on_a_stationary_stream() {
+        let b = bench_with(coincidence_cfg());
+        let dec_cfg = DecoderConfig {
+            bp: BpConfig::plain(48, 160),
+            smc: SmcConfig { k_cols: 256, walkers: 64, beta_steps: 16, ..SmcConfig::default() },
+            esc: EscalationConfig::default(),
+        };
+        let dec = CosetDecoder::new(&b.graph, dec_cfg);
+        let mut work = DecodeWork::default();
+        let nominal_en: Vec<i32> = b.layout.llr_nom.iter().map(|&l| energy_from_llr(l)).collect();
+        let (mut touched, mut blocks, mut static_fail, mut live_fail) = (0u32, 0u32, 0u32, 0u32);
+        for stream in 0..8u64 {
+            let mut st = StreamState::new(&b.layout);
+            for blk in 0..150u64 {
+                let (dets, truth) = b.dem.sample(&b.dem.probs, 700 + stream, blk);
+                let rep = st.ingest_block(&b.layout, &b.cfg, &dets);
+                touched += (rep.modified_mechanisms > 0) as u32;
+                blocks += 1;
+                let id = (stream * 1000 + blk) as u32;
+                static_fail += (dec.decode(&mut work, &b.layout.llr_nom, &nominal_en, &dets, id).obs != truth) as u32;
+                live_fail += (dec.decode(&mut work, &st.llr, &st.en, &dets, id).obs != truth) as u32;
+            }
+        }
+        eprintln!("[coincidence stationary] re-weighted blocks {touched}/{blocks}; failures static={static_fail} live={live_fail}");
+        assert!(touched * 4 <= blocks, "false surgery in {touched}/{blocks} stationary blocks");
+        assert!(live_fail <= static_fail + static_fail / 10 + 3, "stationary penalty: {live_fail} vs {static_fail}");
     }
 
     #[test]
@@ -570,7 +883,18 @@ mod tests {
     /// (near-)erasures, and the decoder fed the live weights must out-survive the static one.
     #[test]
     fn dropout_burst_is_converted_to_erasures_and_survived() {
-        let b = bench();
+        dropout_burst(&bench(), "pairwise", 64);
+    }
+
+    /// Same burst under the coincidence monitor.  Six maximally mixed qubits around one check
+    /// interfere, so the coincidence rate of each is below 1/2: the mechanisms are driven to
+    /// within two nats of an erasure rather than to `w = 0`.
+    #[test]
+    fn dropout_burst_is_survived_by_the_coincidence_monitor() {
+        dropout_burst(&bench_with(coincidence_cfg()), "coincidence", 128);
+    }
+
+    fn dropout_burst(b: &Bench, label: &str, erased_llr: i32) {
         let layers = b.layout.layers;
         let onset_block = 500 / b.rounds;
         let total_blocks = onset_block + 60;
@@ -619,7 +943,7 @@ mod tests {
                     pre_live += (l.obs != truth) as u32;
                     pre_blocks += 1;
                 }
-                let erased = hot_set.iter().filter(|&&q| (0..layers).all(|t| st.llr[t * b.n + q] <= 64)).count();
+                let erased = hot_set.iter().filter(|&&q| (0..layers).all(|t| st.llr[t * b.n + q] <= erased_llr)).count();
                 if hot && erased_at.is_none() && erased == hot_set.len() {
                     erased_at = Some((blk - onset_block as u64 + 1) * layers as u64);
                 }
@@ -632,7 +956,7 @@ mod tests {
         latencies.sort_unstable();
         let p90 = latencies[latencies.len() * 9 / 10];
         eprintln!(
-            "[tls] detection latency layers median={} p90={p90}; erasure latency layers median={} p90={} ({erased_ok}/{streams} streams); \\
+            "[tls {label}] detection latency layers median={} p90={p90}; erasure latency layers median={} p90={} ({erased_ok}/{streams} streams); \\
              post-onset failures static={static_fail} live={live_fail} of {post_blocks}; \\
              pre-onset failures static={pre_static} live={pre_live} of {pre_blocks}",
             latencies[latencies.len() / 2],

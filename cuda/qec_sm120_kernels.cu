@@ -191,6 +191,37 @@ __device__ __forceinline__ int pair_masked(const unsigned char* cnt)
     return n > 0u && (fair_x || fair_y);
 }
 
+// k-point coincidence estimator: a mechanism class is the pattern `check | layer offset << 12`
+// of a mechanism with >= 3 detectors; `tl` is the within-block layer of the pattern's last layer.
+__device__ __forceinline__ int cls_sampled(const QecParams* P, const u32* det, u32 lo, u32 hi, u32 span, u32 tl)
+{
+    if (tl + 1u < span) return 0;
+    const u32* det_of = P_U32(det_of);
+    for (u32 q = lo; q < hi; ++q) {
+        const u32 d = det[q];
+        if (det_of[(tl + 1u - span + (d >> 12)) * P->n_checks + (d & 0xFFFu)] == QEC_NO_DETECTOR) return 0;
+    }
+    return 1;
+}
+
+__device__ __forceinline__ int cls_match(const u32* det, u32 lo, u32 hi, u32 span, const u64* last, const u64* prev)
+{
+    for (u32 q = lo; q < hi; ++q) {
+        const u32 d = det[q], c = d & 0xFFFu;
+        const u64* row = (span == 2u && (d >> 12) == 0u) ? prev : last;
+        if (!((row[c >> 6] >> (c & 63u)) & 1ULL)) return 0;
+    }
+    return 1;
+}
+
+// 2 [k ln(k / mu) - (k - mu)] in Q16 nats against mu = n pi; zero unless the rate exceeds pi
+__device__ __forceinline__ i64 coincidence_g(u32 k, u32 n, u32 pi_q32, int lnpi_q16, const int* logt)
+{
+    if (k == 0u || n == 0u || ((u64)k << 32) <= (u64)n * (u64)pi_q32) return 0;
+    const i64 mu_q16 = ((i64)n * (i64)pi_q32) >> 16;
+    return 2 * ((i64)k * ((i64)logt[k] - (i64)logt[n] - (i64)lnpi_q16) - (((i64)k << 16) - mu_q16));
+}
+
 extern "C" __global__ void qec_neuro_update(const QecParams* P)
 {
     __shared__ int sh_cnt[2];
@@ -214,6 +245,11 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
     u32* hist_pos = (u32*)P->hist_pos + (u64)s * 2;
     u64* cur = P_U64(cur_bits) + (u64)s * wc;
     const u32* pairs = P_U32(pairs);
+    const u32 ncls = P->coincidence ? P->n_cls : 0u;
+    const u32* cls_ptr = P_U32(cls_ptr);
+    const u32* cls_det = P_U32(cls_det);
+    const unsigned char* cls_span = P_U8(cls_span);
+    unsigned char* cls_cnt = P_U8(cls_cnt) + (u64)s * P->n_cls * 2;
     for (u32 l = 0; l < P->layers; ++l) {
         for (u32 w = tid; w < wc; w += nt) cur[w] = 0ULL;
         __syncthreads();
@@ -264,6 +300,53 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
                 pair_bump(cnt, (get_bit(cur, cj) << 2) | (get_bit(prev, cj) << 1) | x, (u32)P->count_cap);
             }
         }
+        // phase 2b: k-point coincidences of the mechanism classes
+        for (u32 k = tid; k < ncls; k += nt) {
+            const u32 lo = cls_ptr[k], hi = cls_ptr[k + 1];
+            const u32 span = cls_span[k];
+            u32 r_heat = 0u;
+            int cooled = 0, any_hot = 0;
+            for (u32 q = lo; q < hi; ++q) {
+                const u32 c = cls_det[q] & 0xFFFu;
+                any_hot |= hot[c] == 1;
+                if (trans[c] > 0) {
+                    if (hot[c] == 1) {
+                        r_heat = trans[c] > r_heat ? trans[c] : r_heat;
+                    } else {
+                        cooled = 1;
+                    }
+                }
+            }
+            unsigned char* cnt = cls_cnt + (u64)k * 2;
+            if (cooled && !any_hot) {
+                cnt[0] = 0;
+                cnt[1] = 0;
+            }
+            if (r_heat > 1u) {
+                // coincidences of the new regime alone; adopted when it shows the higher rate
+                u32 m = 0u, n = 0u;
+                for (u32 back = r_heat - 1u; back >= 1u; --back) {
+                    const u32 slot_t = (head + QEC_HISTORY - (back - 1u)) % QEC_HISTORY;
+                    if (back + span - 1u > hlen || !cls_sampled(P, cls_det, lo, hi, span, hist_layer[slot_t])) continue;
+                    const u32 slot_p = (head + QEC_HISTORY - back) % QEC_HISTORY;
+                    ++n;
+                    m += (u32)cls_match(cls_det, lo, hi, span, hist_bits + (u64)slot_t * wc, hist_bits + (u64)slot_p * wc);
+                }
+                if (n > 0u && (cnt[1] == 0 || m * (u32)cnt[1] > (u32)cnt[0] * n)) {
+                    cnt[0] = (unsigned char)m;
+                    cnt[1] = (unsigned char)n;
+                }
+            }
+            if (cls_sampled(P, cls_det, lo, hi, span, l)) {
+                const int hit = cls_match(cls_det, lo, hi, span, cur, hist_bits + (u64)head * wc);
+                if ((u32)cnt[1] >= (u32)P->coin_cap) {
+                    cnt[0] >>= 1;
+                    cnt[1] >>= 1;
+                }
+                cnt[1] += 1;
+                cnt[0] += (unsigned char)hit;
+            }
+        }
         __syncthreads();
         // phase 3: push the layer into the history ring
         if (tid == 0u) {
@@ -297,6 +380,28 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
         pair_rate[i] = active ? pair_rate_q12(cnt) : (pair_masked(cnt) ? QEC_PAIR_MASKED : QEC_PAIR_VETO);
         explained[i] = 0;
     }
+    // active coincidence rate of every mechanism class (Q12; 0: inactive)
+    int* cls_rate = P_I32(cls_rate) + (u64)s * P->n_cls;
+    const u32* cls_pi = P_U32(cls_pi_q32);
+    const int* cls_lnpi = P_I32(cls_lnpi_q16);
+    for (u32 k = tid; k < ncls; k += nt) {
+        int all_hot = 1;
+        for (u32 q = cls_ptr[k]; q < cls_ptr[k + 1]; ++q) all_hot &= hot[cls_det[q] & 0xFFFu] == 1;
+        const u32 m = cls_cnt[(u64)k * 2], n = cls_cnt[(u64)k * 2 + 1];
+        const i64 g = coincidence_g(m, n, cls_pi[k], cls_lnpi[k], logt);
+        const i64 thr = (i64)(all_hot ? P->g_threshold_hot : P->g_threshold_coin) * 65536;
+        const u32 need = all_hot ? 1u : (u32)P->coin_min;
+        int rate = 0;
+        if (m >= need && g >= thr) {
+            if (P->coin_snap && all_hot && n < (u32)P->n_min) {
+                rate = 2048;
+            } else {
+                rate = (int)((m << 12) / n);
+                rate = rate > 2048 ? 2048 : rate;
+            }
+        }
+        cls_rate[k] = rate;
+    }
     __syncthreads();
     const u32* mp_ptr = P_U32(mech_pair_ptr);
     const u32* mp = P_U32(mech_pair);
@@ -304,6 +409,9 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
     const int* llr_nom = P_I32(llr_nom);
     const int* p_nom = P_I32(p_nom_q12);
     const int* llr_of_p = P_I32(llr_of_p);
+    const u32* mech_cls = P_U32(mech_cls);
+    const u32* sup_ptr = P_U32(cls_sup_ptr);
+    const u32* sup = P_U32(cls_sup);
     int* llr = P_I32(llr) + (u64)s * nv;
     int* en = P_I32(en) + (u64)s * nv;
     for (int phase = 0; phase < 2; ++phase) {
@@ -312,6 +420,22 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
             const u32 lo = mp_ptr[e], hi = mp_ptr[e + 1];
             const int big = msize[e] >= 3;
             if (lo == hi || big != (phase == 0)) continue;
+            if (ncls > 0u && mech_cls[e] != 0xFFFFFFFFu) {
+                // k-point rule: own coincidence rate minus the active containing classes
+                const u32 k = mech_cls[e];
+                int p = cls_rate[k];
+                for (u32 q = sup_ptr[k]; q < sup_ptr[k + 1]; ++q) p -= cls_rate[sup[q]];
+                int value = llr_nom[e];
+                if (p > p_nom[e]) {
+                    int cand = llr_of_p[p > 2048 ? 2048 : p];
+                    value = cand < value ? cand : value;
+                    for (u32 q = lo; q < hi; ++q) atomicMax(&explained[mp[q]], p);
+                }
+                llr[e] = value;
+                en[e] = energy_from_llr(value, P->en_one);
+                modified += value != llr_nom[e];
+                continue;
+            }
             int p = QEC_INT_MAX, veto = 0;
             for (u32 q = lo; q < hi; ++q) {
                 int r = pair_rate[mp[q]];
@@ -507,35 +631,40 @@ extern "C" __global__ void qec_bp_decode(const QecParams* P)
     }
     if (tid == 0u) {
         sh_obs = 0ULL;
-        sh_i[2] = 0;
-        sh_i[3] = QEC_INT_MAX;
+        sh_i[2] = QEC_INT_MAX; // soft margin
+        sh_i[3] = QEC_INT_MAX; // smallest belief magnitude
+        sh_i[4] = QEC_INT_MAX; // soft gap
     }
     __syncthreads();
-    // ---- hard-decision observables and escalation triggers (b), (c)
+    // ---- hard-decision observables and the soft margins behind escalation triggers (b), (c)
     u64 obs_local = 0ULL;
-    int flags = 0;
+    int mrg = QEC_INT_MAX, gap = QEC_INT_MAX;
     for (u32 v = tid; v < n_var; v += nt) {
         if (post[v] >= 0) continue;
         obs_local ^= obs[v];
-        if (!(converged && P->escalate)) continue;
-        if (-post[v] < P->tau_margin) flags |= 2;
+        if (!converged) continue;
+        mrg = -post[v] < mrg ? -post[v] : mrg;
         for (u32 q = vcell_ptr[v]; q < vcell_ptr[v + 1]; ++q) {
             const u32 f = vcell[q];
             int delta = 0;
             for (u32 k = cell_ptr[f]; k < cell_ptr[f + 1]; ++k) {
                 const u32 u = cell_var[k];
                 int a = post[u] < 0 ? -post[u] : post[u];
-                if (a < P->tau_margin) flags |= 2;
+                if (P->margin_gauge) mrg = a < mrg ? a : mrg;
                 delta += post[u] < 0 ? -en[u] : en[u];
             }
-            if (delta < P->tau_gap) flags |= 4;
+            gap = delta < gap ? delta : gap;
         }
     }
     atomicXor(&sh_obs, obs_local);
-    if (flags) atomicOr(&sh_i[2], flags);
+    atomicMin(&sh_i[2], mrg);
+    atomicMin(&sh_i[4], gap);
     __syncthreads();
+    const int esc_margin = sh_i[2], esc_gap = sh_i[4];
     int esc = 0;
-    if (converged && P->escalate) esc = sh_i[2] | (iters > P->t_clean ? 1 : 0);
+    if (converged && P->escalate) {
+        esc = (iters > P->t_late ? 1 : 0) | (esc_margin < P->tau_margin ? 2 : 0) | (esc_gap < P->tau_gap ? 4 : 0);
+    }
     const int slow = !converged || esc != 0;
     const int* order = converged ? post : snap;
     if (slow) {
@@ -582,6 +711,8 @@ extern "C" __global__ void qec_bp_decode(const QecParams* P)
             out->modified_mechanisms = 0;
             out->hot_checks = 0;
         }
+        out->esc_margin = esc_margin;
+        out->esc_gap = esc_gap;
         out->bp_converged = (unsigned char)converged;
         out->esc_reason = (unsigned char)esc;
         out->smc_ran = (unsigned char)slow;
@@ -798,6 +929,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     __shared__ int sh_piv[2];
     __shared__ int sh_i[8];
     __shared__ u64 sh_obs;
+    __shared__ long long sh_pair;
     const u32 tid = threadIdx.x, nt = blockDim.x, blk = blockIdx.x;
     u32* ctrl = (u32*)P->ctrl;
     const u32 rec = ctrl[QEC_CTRL_CURSOR] + blk;
@@ -977,7 +1109,9 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     V.enfree = enfree;
     V.scol = scol;
     V.wr = wr;
-    // ---- every walker performs the same deterministic quench on its own state
+    // ---- every walker performs the same deterministic relaxation on its own state: a
+    // single-cycle quench, then reliability-ordered pair exploration (the block is launched
+    // with exactly `walkers` threads, so every thread is a walker)
     u32 cur = 0u;
     u64* rows = w_rows + ((u64)cur * nw + tid) * wr;
     u64* z = w_z + ((u64)cur * nw + tid) * wz;
@@ -985,31 +1119,67 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     u64 wobs = obs_piv;
     i64 acc = 0;
     const int active_walker = tid < nw;
-    if (active_walker) {
-        for (u32 q = 0; q < wr; ++q) rows[q] = epiv[q];
-        for (u32 q = 0; q < wz; ++q) z[q] = 0ULL;
-        for (int sweep = 0; sweep < P->quench_sweeps; ++sweep) {
-            int moved = 0;
-            for (u32 t = 0; t < n_free; ++t) {
-                const int zt = get_bit(z, t);
-                const int de = delta_energy(V, t, rows, zt);
-                if (de < 0) {
-                    const u64* ct = col + (u64)t * wr;
-                    for (u32 q = 0; q < wr; ++q) rows[q] ^= ct[q];
-                    z[t >> 6] ^= 1ULL << (t & 63);
-                    energy += de;
-                    wobs ^= cycobs[t];
-                    moved = 1;
+    for (u32 q = 0; q < wr; ++q) rows[q] = epiv[q];
+    for (u32 q = 0; q < wz; ++q) z[q] = 0ULL;
+    {
+        const u32 lam = (u32)P->pair_lambda < n_free ? (u32)P->pair_lambda : n_free;
+        // the spare walker buffer is free until the first resampling
+        u64* tmp = w_rows + ((u64)(cur ^ 1u) * nw + tid) * wr;
+        for (int round = 0;; ++round) {
+            for (int sweep = 0; sweep < P->quench_sweeps; ++sweep) {
+                int moved = 0;
+                for (u32 t = 0; t < n_free; ++t) {
+                    const int zt = get_bit(z, t);
+                    const int de = delta_energy(V, t, rows, zt);
+                    if (de < 0) {
+                        const u64* ct = col + (u64)t * wr;
+                        for (u32 q = 0; q < wr; ++q) rows[q] ^= ct[q];
+                        z[t >> 6] ^= 1ULL << (t & 63);
+                        energy += de;
+                        wobs ^= cycobs[t];
+                        moved = 1;
+                    }
+                }
+                if (!moved) break;
+            }
+            if (round >= P->pair_rounds) break;
+            // best pair (i, j) among the `lam` most suspicious chords; thread i scans j > i;
+            // key = (delta, i, j) so the minimum is the CPU's first-best in lexicographic order
+            if (tid == 0u) sh_pair = 0LL;
+            __syncthreads();
+            long long best = 0LL;
+            for (u32 i = tid; i < lam; i += nt) {
+                const int de_i = delta_energy(V, i, rows, get_bit(z, i));
+                const u64* ci = col + (u64)i * wr;
+                for (u32 q = 0; q < wr; ++q) tmp[q] = rows[q] ^ ci[q];
+                for (u32 j = i + 1u; j < lam; ++j) {
+                    const int tot = de_i + delta_energy(V, j, tmp, get_bit(z, j));
+                    const long long key = (long long)tot * 4294967296LL + (long long)((i << 16) | j);
+                    best = key < best ? key : best;
                 }
             }
-            if (!moved) break;
+            if (best < 0LL) atomicMin(&sh_pair, best);
+            __syncthreads();
+            const long long win = sh_pair;
+            if (win >= 0LL) break;
+            const u32 code = (u32)(win & 0xFFFFFFFFLL);
+            const u32 pick[2] = {code >> 16, code & 0xFFFFu};
+            for (int k = 0; k < 2; ++k) {
+                const u32 t = pick[k];
+                energy += delta_energy(V, t, rows, get_bit(z, t));
+                const u64* ct = col + (u64)t * wr;
+                for (u32 q = 0; q < wr; ++q) rows[q] ^= ct[q];
+                z[t >> 6] ^= 1ULL << (t & 63);
+                wobs ^= cycobs[t];
+            }
+            __syncthreads();
         }
-        if (tid == 0u) {
-            for (u32 q = 0; q < wz; ++q) zq[q] = z[q];
-            out->piv_obs = obs_piv;
-            out->piv_energy = en_piv;
-            out->q_obs = wobs;
-        }
+    }
+    if (tid == 0u) {
+        for (u32 q = 0; q < wz; ++q) zq[q] = z[q];
+        out->piv_obs = obs_piv;
+        out->piv_energy = en_piv;
+        out->q_obs = wobs;
     }
     __syncthreads();
     // ---- twist field at the quenched state

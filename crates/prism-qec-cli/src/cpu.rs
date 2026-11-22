@@ -1,7 +1,7 @@
 //! CPU reference pipeline: Hodge-BP fast path + coset SMC slow path over a shot file.
 
-use crate::dataset::{Dataset, DecodeModel};
-use qec_neuro_dem::{run_reference, PipelineConfig, ShotRecord, StreamPlan};
+use crate::dataset::{Dataset, DecodeModel, OracleWeights};
+use qec_neuro_dem::{run_reference_oracle, run_reference_with_weights, PipelineConfig, ShotRecord, StreamPlan};
 use qec_smc_coset::ShotResult;
 use serde::Serialize;
 use std::time::Instant;
@@ -33,16 +33,36 @@ pub struct CpuRun {
     pub results: Vec<ShotResult>,
     pub latency_ns: Vec<u64>,
     pub wall_seconds: f64,
+    /// Live prior LLRs of every stream after its last block (empty for oracle-weight runs).
+    pub live_llr: Vec<i32>,
 }
 
 /// Decodes the planned shots in stream order on the CPU reference pipeline.
 pub fn decode_streams(ds: &Dataset, model: &DecodeModel, plan: &StreamPlan, cfg: &PipelineConfig) -> CpuRun {
     let t0 = Instant::now();
-    let records = run_reference(&model.graph, &model.layout, &ds.dets, plan, cfg);
+    let (records, live_llr) = run_reference_with_weights(&model.graph, &model.layout, &ds.dets, plan, cfg);
     let wall_seconds = t0.elapsed().as_secs_f64();
     let results = records.iter().map(|r| r.result).collect();
     let latency_ns = records.iter().map(|r| r.latency_ns).collect();
-    CpuRun { records, results, latency_ns, wall_seconds }
+    CpuRun { records, results, latency_ns, wall_seconds, live_llr }
+}
+
+/// Decodes the planned shots with the oracle's true drifted weights instead of the monitor.
+pub fn decode_streams_oracle(
+    ds: &Dataset,
+    model: &DecodeModel,
+    plan: &StreamPlan,
+    cfg: &PipelineConfig,
+    oracle: &OracleWeights,
+) -> CpuRun {
+    let t0 = Instant::now();
+    let records = run_reference_oracle(&model.graph, &model.layout, &ds.dets, plan, cfg, |trace, block, llr| {
+        oracle.apply(trace, block, &model.layout.p_nom, llr)
+    });
+    let wall_seconds = t0.elapsed().as_secs_f64();
+    let results = records.iter().map(|r| r.result).collect();
+    let latency_ns = records.iter().map(|r| r.latency_ns).collect();
+    CpuRun { records, results, latency_ns, wall_seconds, live_llr: Vec::new() }
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -112,7 +132,7 @@ pub struct DecodeStats {
     pub auroc_bp_norm: f64,
 }
 
-pub fn stats(ds: &Dataset, results: &[ShotResult], decision: Decision, khat_max: f64) -> DecodeStats {
+pub fn stats(ds: &Dataset, results: &[ShotResult], decision: Decision, khat_max: f64, hle_mode: u32, n_chk: usize) -> DecodeStats {
     let mut st = DecodeStats { shots: results.len(), ..DecodeStats::default() };
     let (mut it, mut cu, mut rk, mut nf, mut ess, mut rs) = (0u64, 0u64, 0u64, 0u64, 0.0f64, 0u64);
     for (s, r) in results.iter().enumerate() {
@@ -148,7 +168,7 @@ pub fn stats(ds: &Dataset, results: &[ShotResult], decision: Decision, khat_max:
         qec_smc_coset::auroc(&slow_idx.iter().map(|&s| f(&results[s])).collect::<Vec<f64>>(), &failed)
     };
     st.slow_path_failures = failed.iter().filter(|&&f| f).count();
-    st.auroc_hle = score(&|r| -r.confidence(khat_max));
+    st.auroc_hle = score(&|r| -r.herald_confidence(hle_mode, khat_max, n_chk));
     st.auroc_gap_only = score(&|r| -r.min_abs_df);
     st.auroc_khat_only = score(&|r| r.khat.min(1e6));
     st.auroc_coset_free_energy = score(&|r| r.mode_free_energy);
@@ -247,10 +267,37 @@ pub fn records_digest(results: &[ShotResult]) -> String {
             r.bp_min_abs as u64,
             r.resamples as u64,
             r.esc_reason as u64,
+            r.esc_margin as u64,
+            r.esc_gap as u64,
             (r.bp_converged as u64) | ((r.smc_ran as u64) << 1) | ((r.solvable as u64) << 2),
         ] {
             h.update(&v.to_le_bytes());
         }
     }
     h.finalize().to_hex().to_string()
+}
+
+/// Writes one CSV row per shot (decisions, energies, certificate values, monitor reaction) for
+/// offline failure analysis against the baseline outputs of the same shots.
+pub fn dump_csv(path: &std::path::Path, ds: &Dataset, records: &[ShotRecord]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(
+        w,
+        "shot,truth,obs,bp_obs,piv_obs,q_obs,best_obs,mode_obs,marginal_obs,bp_converged,bp_iters,bp_unsat,esc_reason,\
+         smc_ran,solvable,rank,n_free,piv_energy,best_energy,energy_gap,mode_free_energy,min_abs_df,khat,ess,bp_min_abs,\
+         resamples,damped_steps,modified,hot_checks,esc_margin,esc_gap"
+    )?;
+    for (s, rec) in records.iter().enumerate() {
+        let r = &rec.result;
+        writeln!(
+            w,
+            "{s},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            ds.truth(s), r.obs, r.bp_obs, r.piv_obs, r.q_obs, r.best_obs, r.mode_obs, r.marginal_obs, r.bp_converged as u8,
+            r.bp_iters, r.bp_unsat, r.esc_reason, r.smc_ran as u8, r.solvable as u8, r.rank, r.n_free, r.piv_energy,
+            r.best_energy, r.energy_gap, r.mode_free_energy, r.min_abs_df, r.khat, r.ess, r.bp_min_abs, r.resamples,
+            r.damped_steps, rec.report.modified_mechanisms, rec.report.hot_checks, r.esc_margin, r.esc_gap
+        )?;
+    }
+    w.flush()
 }

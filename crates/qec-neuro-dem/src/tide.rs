@@ -126,10 +126,54 @@ pub fn pair_rate_q12(counts: &[u8; 8]) -> i32 {
     ((4096 - isqrt_u64(t_q24) as i64) / 2) as i32
 }
 
+/// Adds one sample to a `[matches, exposure]` coincidence counter; both halve once the
+/// exposure reaches `cap` (<= 255), i.e. integer forgetting with a window of `cap` samples.
+#[inline]
+pub fn coincidence_bump(cnt: &mut [u8; 2], hit: bool, cap: u32) {
+    if cnt[1] as u32 >= cap {
+        cnt[0] >>= 1;
+        cnt[1] >>= 1;
+    }
+    cnt[1] += 1;
+    cnt[0] += hit as u8;
+}
+
+/// Likelihood-ratio statistic `2 [k ln(k / mu) - (k - mu)]` (Q16 nats) of `k` coincidences in
+/// `n` samples against the nominal expectation `mu = n pi`: the k-point generalisation of the
+/// pair statistic, for a pattern whose detectors all fire together.  Zero unless the observed
+/// rate exceeds the nominal one.  `pi` is passed as Q32 and as its Q16 logarithm.
+pub fn coincidence_g_q16(k: u32, n: u32, pi_q32: u32, lnpi_q16: i32, logt: &[i32]) -> i64 {
+    if k == 0 || n == 0 || ((k as u64) << 32) <= n as u64 * pi_q32 as u64 {
+        return 0;
+    }
+    let mu_q16 = (n as i64 * pi_q32 as i64) >> 16;
+    2 * (k as i64 * (logt[k as usize] as i64 - logt[n as usize] as i64 - lnpi_q16 as i64) - (((k as i64) << 16) - mu_q16))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use qec_core::fixed::mix64;
+
+    #[test]
+    fn coincidence_statistic_matches_the_poisson_likelihood_ratio() {
+        let logt = log_table_q16();
+        for &(k, n, pi) in &[(2u32, 32u32, 2.0e-5f64), (1, 6, 1.0e-3), (6, 255, 1.0e-3), (9, 64, 0.06)] {
+            let (pi_q32, lnpi) = ((pi * 4294967296.0).round() as u32, (pi.ln() * 65536.0).round() as i32);
+            let mu = n as f64 * pi;
+            let exact = 2.0 * (k as f64 * (k as f64 / mu).ln() - (k as f64 - mu));
+            let got = coincidence_g_q16(k, n, pi_q32, lnpi, &logt) as f64 / 65536.0;
+            assert!((got - exact).abs() < 0.02 * exact.max(1.0), "k={k} n={n} pi={pi}: {got} vs {exact}");
+        }
+        // at or below the nominal rate there is no evidence
+        assert_eq!(coincidence_g_q16(1, 200, (0.01f64 * 4294967296.0) as u32, (0.01f64.ln() * 65536.0) as i32, &logt), 0);
+        assert_eq!(coincidence_g_q16(0, 50, 1000, -900_000, &logt), 0);
+        let mut cnt = [0u8; 2];
+        for i in 0..1000 {
+            coincidence_bump(&mut cnt, i % 4 == 0, 64);
+        }
+        assert!(cnt[1] <= 64 && cnt[1] >= 32 && (cnt[0] as i32 * 4 - cnt[1] as i32).abs() <= 6, "{cnt:?}");
+    }
 
     fn uniform(seed: u64, i: u64) -> f64 {
         (mix64(seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 11) as f64 / (1u64 << 53) as f64

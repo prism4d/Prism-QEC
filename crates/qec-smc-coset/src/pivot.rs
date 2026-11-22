@@ -28,6 +28,23 @@ pub fn bucket_of(post: i32) -> usize {
     ((post >> 3) + 512).clamp(0, BUCKETS as i32 - 1) as usize
 }
 
+/// Budget of the deterministic zero-temperature search started at the forest solution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Relax {
+    /// Sweeps of single-cycle descent per quench.
+    pub quench_sweeps: u32,
+    /// Pair exploration over the `pair_lambda` most suspicious chords (0 disables it).
+    pub pair_lambda: u32,
+    /// Maximum number of accepted pair moves.
+    pub pair_rounds: u32,
+}
+
+impl Relax {
+    pub fn quench_only(quench_sweeps: u32) -> Self {
+        Self { quench_sweeps, pair_lambda: 0, pair_rounds: 0 }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Pivot {
     /// Number of suspect columns.
@@ -129,14 +146,14 @@ impl Pivot {
 
 /// Builds the pivot for one shot.  `en` are Nishimori weights (SMC units), `post` the BP
 /// posteriors that order the suspects, `syndrome` the bit-packed detector syndrome.
-/// `quench_sweeps` bounds the zero-temperature descent that centres the twisted reference.
+/// `relax` bounds the zero-temperature search that centres the twisted reference.
 pub fn build_pivot(
     g: &TannerGraph,
     en: &[i32],
     post: &[i32],
     syndrome: &[u64],
     k_cols: usize,
-    quench_sweeps: u32,
+    relax: Relax,
     scratch: &mut PivotScratch,
 ) -> Pivot {
     let n_var = g.n_var;
@@ -281,31 +298,37 @@ pub fn build_pivot(
         obs_q: 0,
         theta: Vec::new(),
     };
-    pivot.quench(quench_sweeps);
+    pivot.relax(relax);
     pivot
 }
 
+/// Mutable search state: pivot-row bits, chord bits, energy and logical word.
+struct SearchState {
+    rows: Vec<u64>,
+    z: Vec<u64>,
+    energy: i32,
+    obs: u64,
+}
+
 impl Pivot {
-    /// Deterministic-scan zero-temperature descent from the forest solution: a cycle is
-    /// toggled whenever that strictly lowers the Nishimori energy.  Stops after
-    /// `max_sweeps` sweeps or at the first sweep without a move, then evaluates the twist.
-    pub fn quench(&mut self, max_sweeps: u32) {
-        let n_free = self.n_free();
-        let mut rows = self.e_piv.clone();
-        let mut z = vec![0u64; n_free.div_ceil(64).max(1)];
-        let (mut energy, mut obs) = (self.en_piv, self.obs_piv);
+    fn toggle(&self, st: &mut SearchState, t: usize, de: i32) {
+        for (r, c) in st.rows.iter_mut().zip(self.col(t)) {
+            *r ^= *c;
+        }
+        st.z[t >> 6] ^= 1 << (t & 63);
+        st.energy += de;
+        st.obs ^= self.cyc_obs[t];
+    }
+
+    /// Deterministic-scan descent: a cycle is toggled whenever that strictly lowers the
+    /// Nishimori energy; stops after `max_sweeps` sweeps or at the first sweep without a move.
+    fn quench_from(&self, st: &mut SearchState, max_sweeps: u32) {
         for _ in 0..max_sweeps {
             let mut moved = false;
-            for t in 0..n_free {
-                let zt = (z[t >> 6] >> (t & 63)) & 1 == 1;
-                let de = self.delta_energy(t, &rows, zt);
+            for t in 0..self.n_free() {
+                let de = self.delta_energy(t, &st.rows, (st.z[t >> 6] >> (t & 63)) & 1 == 1);
                 if de < 0 {
-                    for (r, c) in rows.iter_mut().zip(self.col(t)) {
-                        *r ^= *c;
-                    }
-                    z[t >> 6] ^= 1 << (t & 63);
-                    energy += de;
-                    obs ^= self.cyc_obs[t];
+                    self.toggle(st, t, de);
                     moved = true;
                 }
             }
@@ -313,13 +336,59 @@ impl Pivot {
                 break;
             }
         }
+    }
+
+    /// Zero-temperature search from the forest solution, then the twist field.
+    ///
+    /// 1. single-cycle quench;
+    /// 2. reliability-ordered pair exploration: among the `pair_lambda` most suspicious chords
+    ///    (they lead the suspect list), the pair of cycles whose joint toggle lowers the energy
+    ///    most is applied (ties: smallest `(i, j)`), followed by another quench; repeated until
+    ///    no pair improves or `pair_rounds` pairs were taken.
+    ///
+    /// Every step is a deterministic function of the pivot, so the SM120 kernel mirrors it.
+    pub fn relax(&mut self, relax: Relax) {
+        let n_free = self.n_free();
+        let mut st = SearchState {
+            rows: self.e_piv.clone(),
+            z: vec![0u64; n_free.div_ceil(64).max(1)],
+            energy: self.en_piv,
+            obs: self.obs_piv,
+        };
+        self.quench_from(&mut st, relax.quench_sweeps);
+        let lam = (relax.pair_lambda as usize).min(n_free);
+        let mut tmp = vec![0u64; self.wr];
+        for _ in 0..relax.pair_rounds {
+            let (mut best, mut bi, mut bj) = (0i32, usize::MAX, usize::MAX);
+            for i in 0..lam {
+                let zi = (st.z[i >> 6] >> (i & 63)) & 1 == 1;
+                let de_i = self.delta_energy(i, &st.rows, zi);
+                for (d, (r, c)) in tmp.iter_mut().zip(st.rows.iter().zip(self.col(i))) {
+                    *d = *r ^ *c;
+                }
+                for j in i + 1..lam {
+                    let tot = de_i + self.delta_energy(j, &tmp, (st.z[j >> 6] >> (j & 63)) & 1 == 1);
+                    if tot < best {
+                        (best, bi, bj) = (tot, i, j);
+                    }
+                }
+            }
+            if bi == usize::MAX {
+                break;
+            }
+            let de_i = self.delta_energy(bi, &st.rows, (st.z[bi >> 6] >> (bi & 63)) & 1 == 1);
+            self.toggle(&mut st, bi, de_i);
+            let de_j = self.delta_energy(bj, &st.rows, (st.z[bj >> 6] >> (bj & 63)) & 1 == 1);
+            self.toggle(&mut st, bj, de_j);
+            self.quench_from(&mut st, relax.quench_sweeps);
+        }
         self.theta = (0..n_free)
-            .map(|t| self.delta_energy(t, &rows, (z[t >> 6] >> (t & 63)) & 1 == 1).clamp(-TWIST_CLIP, TWIST_CLIP))
+            .map(|t| self.delta_energy(t, &st.rows, (st.z[t >> 6] >> (t & 63)) & 1 == 1).clamp(-TWIST_CLIP, TWIST_CLIP))
             .collect();
-        self.zq = z;
-        self.rows_q = rows;
-        self.en_q = energy;
-        self.obs_q = obs;
+        self.zq = st.z;
+        self.rows_q = st.rows;
+        self.en_q = st.energy;
+        self.obs_q = st.obs;
     }
 }
 
@@ -358,7 +427,7 @@ mod tests {
                         if (truth[v >> 6] >> (v & 63)) & 1 == 1 { noise - 150 } else { noise + 50 }
                     })
                     .collect();
-                let p = build_pivot(&g, &en, &post, &syn, g.n_var, 0, &mut scratch);
+                let p = build_pivot(&g, &en, &post, &syn, g.n_var, Relax::quench_only(0), &mut scratch);
                 assert!(p.solvable, "all columns are suspects, so the syndrome is always in span");
                 assert_eq!(p.rank + p.n_free(), g.n_var);
                 let zero_z = vec![0u64; p.n_free().div_ceil(64).max(1)];
@@ -407,11 +476,11 @@ mod tests {
         let post: Vec<i32> =
             (0..g.n_var).map(|v| if (truth[v >> 6] >> (v & 63)) & 1 == 1 { -500 } else { 500 + v as i32 }).collect();
         let mut scratch = PivotScratch::default();
-        let p = build_pivot(&g, &en, &post, &syn, g.n_var, 0, &mut scratch);
+        let p = build_pivot(&g, &en, &post, &syn, g.n_var, Relax::quench_only(0), &mut scratch);
         let e0 = p.error_bits(g.n_var, &p.e_piv, &vec![0u64; p.n_free().div_ceil(64).max(1)]);
         assert_eq!(e0, truth, "with a perfect reliability order the forest solution is the truth");
         // too few suspects: reported as unsolvable rather than returning a wrong solution
-        let tiny = build_pivot(&g, &en, &post, &syn, 2, 0, &mut scratch);
+        let tiny = build_pivot(&g, &en, &post, &syn, 2, Relax::quench_only(0), &mut scratch);
         assert!(!tiny.solvable);
     }
 
@@ -422,13 +491,25 @@ mod tests {
         let en: Vec<i32> = (0..g.n_var).map(|v| 40 + (mix64(v as u64) % 60) as i32).collect();
         let mut scratch = PivotScratch::default();
         let mut improved = 0;
+        let mut pair_gain = 0;
         for seed in 0..20u64 {
             let truth = random_error(g.n_var, 0.04, 100 + seed);
             let syn = g.syndrome_of(&truth);
             // uninformative reliabilities: the forest solution is far from minimal
             let post: Vec<i32> = (0..g.n_var).map(|v| (mix64(seed * 31 + v as u64) % 1000) as i32).collect();
-            let p = build_pivot(&g, &en, &post, &syn, g.n_var, 64, &mut scratch);
+            let p = build_pivot(&g, &en, &post, &syn, g.n_var, Relax::quench_only(64), &mut scratch);
             assert!(p.en_q <= p.en_piv);
+            // pair exploration can only lower the energy further and keeps every invariant
+            let relax = Relax { quench_sweeps: 64, pair_lambda: 48, pair_rounds: 16 };
+            let pp = build_pivot(&g, &en, &post, &syn, g.n_var, relax, &mut scratch);
+            assert!(pp.en_q <= p.en_q);
+            pair_gain += (pp.en_q < p.en_q) as u32;
+            let ee = pp.error_bits(g.n_var, &pp.rows_q, &pp.zq);
+            assert_eq!(g.syndrome_of(&ee), syn);
+            assert_eq!(g.observables_of(&ee), pp.obs_q);
+            let direct: i32 = (0..g.n_var).filter(|&v| (ee[v >> 6] >> (v & 63)) & 1 == 1).map(|v| en[v]).sum();
+            assert_eq!(direct, pp.en_q);
+            assert!(pp.theta.iter().all(|&t| t >= 0));
             improved += (p.en_q < p.en_piv) as u32;
             let e = p.error_bits(g.n_var, &p.rows_q, &p.zq);
             assert_eq!(g.syndrome_of(&e), syn, "the quenched state still satisfies the syndrome");
@@ -438,5 +519,6 @@ mod tests {
             assert!(p.theta.iter().all(|&t| t >= 0), "no single cycle move lowers the energy");
         }
         assert!(improved >= 15, "quench improved only {improved}/20 forest solutions");
+        assert!(pair_gain >= 1, "pair exploration never found a lower state");
     }
 }

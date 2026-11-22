@@ -1,11 +1,13 @@
-//! The single immutable decoder configuration.
+//! The immutable decoder configurations.
 //!
-//! Every dimensionless solver parameter lives in [`CanonicalDecoderConfig::FROZEN_V1`]; its
-//! SHA-256 identity is recorded in every receipt.  Calibration may inspect only datasets of
-//! the `CALIB_2026` seed domain; datasets of the `BLIND_HOLDOUT_2026` domain are decoded with
-//! this constant and nothing else: there is no per-code, per-distance or per-noise branch.
-//! The one size that must follow the problem, the number of suspect columns handed to the
-//! pivot, is a fixed multiple of the detector count.
+//! Every dimensionless solver parameter lives in one frozen constant whose SHA-256 identity is
+//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V2`] is the active one;
+//! [`CanonicalDecoderConfig::FROZEN_V1`] is deprecated and stays reachable (same behaviour,
+//! same identity hash as when it was frozen).  Development may inspect only datasets of the
+//! `CALIB_2026` and `SMOKE_2026` seed domains; datasets of the `BLIND_HOLDOUT_2026` domain are
+//! decoded with the active constant and nothing else: there is no per-code, per-distance or
+//! per-noise branch.  The one size that must follow the problem, the number of suspect
+//! columns handed to the pivot, is a fixed multiple of the detector count.
 
 use crate::pipeline::PipelineConfig;
 use crate::stream::NeuroConfig;
@@ -16,10 +18,13 @@ use sha2::{Digest, Sha256};
 
 pub const SEED_DOMAIN_CALIB: &str = "CALIB_2026";
 pub const SEED_DOMAIN_BLIND: &str = "BLIND_HOLDOUT_2026";
+pub const SEED_DOMAIN_SMOKE: &str = "SMOKE_2026";
 
 /// All fields are integers so the canonical serialisation, and therefore the hash, is exact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanonicalDecoderConfig {
+    /// Configuration generation: 1 = `FROZEN_V1` (deprecated), 2 = `FROZEN_V2`.
+    pub version: u32,
     // ---- fast path: damped min-sum
     pub t_max: u32,
     pub t_clean: u32,
@@ -57,12 +62,40 @@ pub struct CanonicalDecoderConfig {
     pub disorder_seed: u64,
     pub smc_seed: u64,
     pub neuro_seed: u64,
+    // ---- introduced by version 2 (part of the identity hash only when `version >= 2`)
+    /// Iterations after which a converged fast path counts as late (V1: `t_clean`).
+    pub t_late: u32,
+    /// Reliability-ordered pair exploration of the pivot relaxation (V1: off).
+    pub pair_lambda: u32,
+    pub pair_rounds: u32,
+    /// Herald functional: 0 = PSIS-gated free-energy gap (V1), 1 = coset mass split plus
+    /// soft syndrome gap.
+    pub hle_mode: u32,
+    /// Escalation margin over the decoded faults and their gauge alternatives (1, V1) or over
+    /// the decoded faults only (0).
+    pub margin_gauge: u32,
+    /// Monitor: k-point coincidence estimator for mechanisms with >= 3 detectors (V1: off),
+    /// its window, the coincidences required from cold checks, and the erasure snap.
+    pub coincidence: u32,
+    pub coin_cap: u32,
+    pub coin_min: u32,
+    pub g_threshold_coin: u32,
+    pub snap: u32,
 }
 
 impl CanonicalDecoderConfig {
-    pub const CONFIG_ID: &'static str = "FROZEN_V1";
-
     pub const FROZEN_V1: Self = Self {
+        version: 1,
+        t_late: 16,
+        pair_lambda: 0,
+        pair_rounds: 0,
+        hle_mode: 0,
+        margin_gauge: 1,
+        coincidence: 0,
+        coin_cap: 64,
+        coin_min: 2,
+        g_threshold_coin: 24,
+        snap: 0,
         t_max: 64,
         t_clean: 16,
         alpha_q8: 160,
@@ -96,7 +129,47 @@ impl CanonicalDecoderConfig {
         neuro_seed: 0x5052_4953_4D4E_4555,
     };
 
-    /// Canonical serialisation: `key=value` lines in declaration order.
+    /// Identity hash `FROZEN_V1` had when it was frozen on `CALIB_2026`.
+    pub const FROZEN_V1_SHA256: &'static str = "5afd73a62875827958a8ba424adfe77687b1b76ba44d8e1d6e90e1e0e60858c9";
+
+    /// Frozen on `CALIB_2026` (bb72 and surface_d5 at p = 0.002, bb72 drift) with `SMOKE_2026`
+    /// cross-checks; differs from `FROZEN_V1` in:
+    ///
+    /// * escalation: the late-convergence trigger is off (`t_late = t_max`) and the margin
+    ///   covers the decoded faults only (same accuracy, far fewer escalations);
+    /// * herald: coset mass split plus soft syndrome gap instead of the PSIS-gated gap;
+    /// * monitor: k-point coincidence estimator with a 255-sample window, activation from a
+    ///   single coincidence at 14 nats, the erasure snap, and a 16x larger nominal reference.
+    ///
+    /// Pair exploration of the pivot relaxation stays off: it did not lower the logical
+    /// error rate on any development set.
+    pub const FROZEN_V2: Self = Self {
+        version: 2,
+        t_late: 64,
+        margin_gauge: 0,
+        hle_mode: 1,
+        coincidence: 1,
+        coin_cap: 255,
+        coin_min: 1,
+        g_threshold_coin: 14,
+        snap: 1,
+        mc_blocks: 65536,
+        ..Self::FROZEN_V1
+    };
+
+    /// The configuration every evaluation uses unless the deprecated one is requested.
+    pub const ACTIVE: Self = Self::FROZEN_V2;
+
+    pub fn config_id(&self) -> &'static str {
+        if self.version <= 1 {
+            "FROZEN_V1"
+        } else {
+            "FROZEN_V2"
+        }
+    }
+
+    /// Canonical serialisation: `key=value` lines in declaration order.  Version 1 serialises
+    /// exactly the fields it was frozen with, so its identity hash never changes.
     pub fn canonical_text(&self) -> String {
         let fields: [(&str, i128); 31] = [
             ("t_max", self.t_max as i128),
@@ -135,6 +208,24 @@ impl CanonicalDecoderConfig {
         for (k, v) in fields {
             out.push_str(&format!("{k}={v}\n"));
         }
+        if self.version >= 2 {
+            let added: [(&str, i128); 11] = [
+                ("version", self.version as i128),
+                ("t_late", self.t_late as i128),
+                ("pair_lambda", self.pair_lambda as i128),
+                ("pair_rounds", self.pair_rounds as i128),
+                ("hle_mode", self.hle_mode as i128),
+                ("margin_gauge", self.margin_gauge as i128),
+                ("coincidence", self.coincidence as i128),
+                ("coin_cap", self.coin_cap as i128),
+                ("coin_min", self.coin_min as i128),
+                ("g_threshold_coin", self.g_threshold_coin as i128),
+                ("snap", self.snap as i128),
+            ];
+            for (k, v) in added {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
         out
     }
 
@@ -166,6 +257,11 @@ impl CanonicalDecoderConfig {
             mc_blocks: self.mc_blocks,
             seed: self.neuro_seed,
             bocpd_only: false,
+            coincidence: self.coincidence != 0,
+            coin_cap: self.coin_cap,
+            coin_min: self.coin_min,
+            g_threshold_coin: self.g_threshold_coin,
+            snap: self.snap != 0,
         }
     }
 
@@ -189,11 +285,19 @@ impl CanonicalDecoderConfig {
                 sweeps: self.sweeps,
                 seed: self.smc_seed,
                 quench_sweeps: self.quench_sweeps,
+                pair_lambda: self.pair_lambda,
+                pair_rounds: self.pair_rounds,
                 resample_q8: self.resample_q8,
                 tau_cert: self.tau_cert_milli as f64 / 1000.0,
                 khat_max: self.khat_max_milli as f64 / 1000.0,
             },
-            esc: EscalationConfig { enabled: true, tau_margin: self.tau_margin, tau_gap: self.tau_gap },
+            esc: EscalationConfig {
+                enabled: true,
+                tau_margin: self.tau_margin,
+                tau_gap: self.tau_gap,
+                t_late: self.t_late,
+                margin_gauge: self.margin_gauge != 0,
+            },
         }
     }
 
@@ -210,8 +314,26 @@ mod tests {
     #[test]
     fn identity_hash_is_stable_and_sensitive_to_every_field() {
         let base = CanonicalDecoderConfig::FROZEN_V1;
-        assert_eq!(base.sha256().len(), 64);
-        assert_eq!(base.sha256(), CanonicalDecoderConfig::FROZEN_V1.sha256());
+        assert_eq!(base.sha256(), CanonicalDecoderConfig::FROZEN_V1_SHA256);
+        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V2"));
+        let v2 = CanonicalDecoderConfig::FROZEN_V2;
+        assert_ne!(v2.sha256(), base.sha256());
+        for f in 0..10 {
+            let mut w = v2;
+            match f {
+                9 => w.g_threshold_coin += 1,
+                8 => w.margin_gauge += 1,
+                0 => w.t_late += 1,
+                1 => w.pair_lambda += 1,
+                2 => w.pair_rounds += 1,
+                3 => w.hle_mode += 1,
+                4 => w.coincidence += 1,
+                5 => w.coin_cap += 1,
+                6 => w.coin_min += 1,
+                _ => w.snap += 1,
+            }
+            assert_ne!(w.sha256(), v2.sha256());
+        }
         let mut variants = vec![base; 6];
         variants[0].eta_q8 += 1;
         variants[1].tau_gap += 1;

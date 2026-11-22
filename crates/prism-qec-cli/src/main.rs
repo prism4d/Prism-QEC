@@ -12,14 +12,23 @@ use anyhow::{ensure, Result};
 use clap::{Args, Parser, Subcommand};
 use cpu::Decision;
 use dataset::{Dataset, DecodeModel};
-use qec_neuro_dem::{CanonicalDecoderConfig, PipelineConfig, SEED_DOMAIN_BLIND, SEED_DOMAIN_CALIB};
+use qec_neuro_dem::{CanonicalDecoderConfig, PipelineConfig, SEED_DOMAIN_BLIND, SEED_DOMAIN_CALIB, SEED_DOMAIN_SMOKE};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "prism-qec", version, about = "PRISM-QEC: damped min-sum + Nishimori coset SMC decoder")]
 struct Cli {
+    /// Frozen configuration: `v2` (active) or the deprecated `v1`.
+    #[arg(long, global = true, value_enum, default_value_t = Frozen::V2)]
+    frozen: Frozen,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Frozen {
+    V1,
+    V2,
 }
 
 #[derive(Subcommand)]
@@ -31,17 +40,17 @@ enum Cmd {
         #[arg(long)]
         dataset: PathBuf,
     },
-    /// Calibration run on a `CALIB_2026` dataset: `FROZEN_V1` with explicit overrides.
-    /// Refuses datasets of any other seed domain.
+    /// Development run on a `CALIB_2026` or `SMOKE_2026` dataset: the frozen configuration
+    /// with explicit overrides.  Refuses datasets of any other seed domain.
     Calibrate {
         #[arg(long)]
         dataset: PathBuf,
         #[arg(long)]
         shots: Option<usize>,
         #[command(flatten)]
-        over: Overrides,
+        over: Box<Overrides>,
     },
-    /// Decode a dataset with the CPU reference pipeline under `FROZEN_V1` (no overrides).
+    /// Decode a dataset with the CPU reference pipeline under the frozen configuration (no overrides).
     CpuDecode {
         #[arg(long)]
         dataset: PathBuf,
@@ -50,8 +59,11 @@ enum Cmd {
         /// Freeze the detector error model at its nominal weights (static-DEM ablation).
         #[arg(long)]
         static_dem: bool,
+        /// Write one CSV row per shot for offline failure analysis.
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
-    /// Run the whole evaluation campaign of a dataset root on the RTX 5080 under `FROZEN_V1`
+    /// Run the whole evaluation campaign of a dataset root on the RTX 5080 under the frozen configuration
     /// (requires the GPU lease), write `qec_frontier_receipt.json` and seal the directory.
     Campaign {
         #[arg(long)]
@@ -65,8 +77,12 @@ enum Cmd {
         /// Per-shot latency launches on every other cell at p = 0.003.
         #[arg(long, default_value_t = 2000)]
         latency_shots_other: usize,
+        /// Explicit operator release: required to decode a `BLIND_HOLDOUT_2026` root.  The
+        /// frozen configuration must not be changed after this has been used.
+        #[arg(long)]
+        release_blind: bool,
     },
-    /// Decode a shot prefix on the RTX 5080 and on the CPU reference under `FROZEN_V1` and
+    /// Decode a shot prefix on the RTX 5080 and on the CPU reference under the frozen configuration and
     /// compare the records field by field (requires the GPU lease).
     GpuParity {
         #[arg(long)]
@@ -106,7 +122,7 @@ fn utc_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
-/// Calibration-only overrides of individual `FROZEN_V1` fields.
+/// Development-only overrides of individual fields of the frozen configuration.
 #[derive(Args, Clone, Debug)]
 pub struct Overrides {
     #[arg(long)]
@@ -143,6 +159,40 @@ pub struct Overrides {
     pub quench_sweeps: Option<u32>,
     #[arg(long)]
     pub resample_q8: Option<u32>,
+    #[arg(long)]
+    pub t_late: Option<u32>,
+    #[arg(long)]
+    pub pair_lambda: Option<u32>,
+    #[arg(long)]
+    pub pair_rounds: Option<u32>,
+    #[arg(long)]
+    pub hle_mode: Option<u32>,
+    #[arg(long)]
+    pub margin_gauge: Option<u32>,
+    #[arg(long)]
+    pub coincidence: Option<u32>,
+    #[arg(long)]
+    pub coin_cap: Option<u32>,
+    #[arg(long)]
+    pub coin_min: Option<u32>,
+    #[arg(long)]
+    pub g_threshold_coin: Option<u32>,
+    #[arg(long)]
+    pub mc_blocks: Option<u32>,
+    #[arg(long)]
+    pub hazard_inv: Option<u32>,
+    #[arg(long)]
+    pub snap: Option<u32>,
+    #[arg(long)]
+    pub g_threshold: Option<u32>,
+    #[arg(long)]
+    pub g_threshold_hot: Option<u32>,
+    #[arg(long)]
+    pub n_min: Option<u32>,
+    #[arg(long)]
+    pub hot_on_milli: Option<u32>,
+    #[arg(long)]
+    pub hot_off_milli: Option<u32>,
     /// Accept every converged fast path (escalation ablation).
     #[arg(long)]
     pub no_escalation: bool,
@@ -152,6 +202,13 @@ pub struct Overrides {
     /// (must give the identical record digest).
     #[arg(long)]
     pub flooding: bool,
+    /// Write one CSV row per shot for offline failure analysis.
+    #[arg(long)]
+    pub dump: Option<PathBuf>,
+    /// Drift datasets: decode with the oracle's true drifted weights (`oracle_weights.json`)
+    /// instead of the monitor: the bound on what any online monitor can gain.
+    #[arg(long)]
+    pub oracle_weights: bool,
     #[arg(long, value_enum, default_value_t = Decision::Mode)]
     pub decision: Decision,
 }
@@ -163,29 +220,43 @@ impl Overrides {
         }
         set!(
             t_max, t_clean, alpha_q8, eta_q8, eps_q12, disorder_q8, margin, tau_margin, tau_gap, cycle_weight, cell_cap,
-            k_cols_per_det_q8, walkers, beta_steps, sweeps, quench_sweeps, resample_q8
+            k_cols_per_det_q8, walkers, beta_steps, sweeps, quench_sweeps, resample_q8, t_late, pair_lambda, pair_rounds,
+            hle_mode, margin_gauge, coincidence, coin_cap, coin_min, g_threshold_coin, mc_blocks, hazard_inv, snap, g_threshold, g_threshold_hot, n_min, hot_on_milli, hot_off_milli
         );
         c
     }
 }
 
 fn run_and_report(
+    dir: &std::path::Path,
     ds: &Dataset,
     canon: &CanonicalDecoderConfig,
     cfg: &PipelineConfig,
     shots: Option<usize>,
     decision: Decision,
+    dump: Option<&std::path::Path>,
+    oracle: Option<&dataset::OracleWeights>,
 ) -> Result<()> {
     let model = DecodeModel::build(&ds.dem, canon.cycle_search(), &cfg.neuro)?;
     let plan = ds.plan(256, shots);
-    let run = cpu::decode_streams(ds, &model, &plan, cfg);
-    let st = cpu::stats(ds, &run.results, decision, cfg.decoder.smc.khat_max);
+    let run = match oracle {
+        Some(o) => cpu::decode_streams_oracle(ds, &model, &plan, cfg, o),
+        None => cpu::decode_streams(ds, &model, &plan, cfg),
+    };
+    let st = cpu::stats(ds, &run.results, decision, cfg.decoder.smc.khat_max, canon.hle_mode, model.graph.n_chk);
     println!("{}", serde_json::to_string_pretty(&st)?);
     if ds.is_burst() {
         let obs: Vec<u64> = run.results.iter().map(|r| cpu::decided_obs(r, decision)).collect();
         println!("{}", serde_json::to_string_pretty(&cpu::burst_stats(ds, &plan, &obs, Some(&run.records)))?);
+        if !run.live_llr.is_empty() && ds.meta["regime"].as_str() == Some("xtburst") {
+            let edges = campaign::crosstalk_edge_scores(ds, dir, &model, &run.live_llr, plan.streams)?;
+            println!("crosstalk_edges={}", serde_json::to_string(&edges)?);
+        }
     }
     println!("records_digest={}", cpu::records_digest(&run.results));
+    if let Some(path) = dump {
+        cpu::dump_csv(path, ds, &run.records)?;
+    }
     println!(
         "latency_ns={} wall={:.2}s cells={} k_cols={}",
         serde_json::to_string(&cpu::percentiles(&run.latency_ns))?,
@@ -196,13 +267,26 @@ fn run_and_report(
     Ok(())
 }
 
+/// Blind-holdout shots are quarantined: only `campaign --release-blind` may decode them.
+fn ensure_not_blind(ds: &Dataset) -> Result<()> {
+    ensure!(
+        ds.seed_domain() != SEED_DOMAIN_BLIND,
+        "'{}' is a {SEED_DOMAIN_BLIND} dataset: it may only be decoded by `campaign --release-blind`",
+        ds.name
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let frozen = CanonicalDecoderConfig::FROZEN_V1;
+    let frozen = match cli.frozen {
+        Frozen::V1 => CanonicalDecoderConfig::FROZEN_V1,
+        Frozen::V2 => CanonicalDecoderConfig::FROZEN_V2,
+    };
     match cli.cmd {
         Cmd::Config => {
             print!("{}", frozen.canonical_text());
-            println!("config_id={} config_sha256={}", CanonicalDecoderConfig::CONFIG_ID, frozen.sha256());
+            println!("config_id={} config_sha256={}", frozen.config_id(), frozen.sha256());
         }
         Cmd::Inspect { dataset } => {
             let ds = Dataset::load(&dataset)?;
@@ -239,8 +323,8 @@ fn main() -> Result<()> {
         Cmd::Calibrate { dataset, shots, over } => {
             let ds = Dataset::load(&dataset)?;
             ensure!(
-                ds.seed_domain() == SEED_DOMAIN_CALIB,
-                "calibration may only inspect {SEED_DOMAIN_CALIB} datasets; '{}' is {}",
+                ds.seed_domain() == SEED_DOMAIN_CALIB || ds.seed_domain() == SEED_DOMAIN_SMOKE,
+                "development runs may only inspect {SEED_DOMAIN_CALIB} / {SEED_DOMAIN_SMOKE} datasets; '{}' is {}",
                 ds.name,
                 ds.seed_domain()
             );
@@ -248,19 +332,20 @@ fn main() -> Result<()> {
             let mut cfg = canon.pipeline(ds.dem.n_det, ds.dem.n_err(), !over.static_dem);
             cfg.decoder.esc.enabled = !over.no_escalation;
             cfg.decoder.bp.wavefront = !over.flooding;
-            println!("calibration config sha256={} (FROZEN_V1 is {})", canon.sha256(), frozen.sha256());
-            run_and_report(&ds, &canon, &cfg, shots, over.decision)?;
+            println!("development config sha256={} ({} is {})", canon.sha256(), frozen.config_id(), frozen.sha256());
+            let oracle = if over.oracle_weights { Some(dataset::OracleWeights::load(&dataset, &ds.dem)?) } else { None };
+            run_and_report(&dataset, &ds, &canon, &cfg, shots, over.decision, over.dump.as_deref(), oracle.as_ref())?;
         }
-        Cmd::CpuDecode { dataset, shots, static_dem } => {
+        Cmd::CpuDecode { dataset, shots, static_dem, dump } => {
             let ds = Dataset::load(&dataset)?;
+            ensure_not_blind(&ds)?;
             let cfg = frozen.pipeline(ds.dem.n_det, ds.dem.n_err(), !static_dem);
-            if ds.seed_domain() == SEED_DOMAIN_BLIND {
-                println!("blind evaluation under {} sha256={}", CanonicalDecoderConfig::CONFIG_ID, frozen.sha256());
-            }
-            run_and_report(&ds, &frozen, &cfg, shots, Decision::Mode)?;
+            run_and_report(&dataset, &ds, &frozen, &cfg, shots, Decision::Mode, dump.as_deref(), None)?;
         }
-        Cmd::Campaign { root, parity_shots, latency_shots, latency_shots_other } => {
+        Cmd::Campaign { root, parity_shots, latency_shots, latency_shots_other, release_blind } => {
             campaign::run(&campaign::CampaignArgs {
+                frozen,
+                release_blind,
                 root,
                 parity_shots,
                 latency_shots,
@@ -271,6 +356,7 @@ fn main() -> Result<()> {
         }
         Cmd::GpuParity { dataset, shots, static_dem, flooding } => {
             let ds = Dataset::load(&dataset)?;
+            ensure_not_blind(&ds)?;
             let mut cfg = frozen.pipeline(ds.dem.n_det, ds.dem.n_err(), !static_dem);
             let model = DecodeModel::build(&ds.dem, frozen.cycle_search(), &cfg.neuro)?;
             let plan = ds.plan(256, Some(shots));

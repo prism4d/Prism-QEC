@@ -88,6 +88,8 @@ fn out_to_record(o: &QecShotOut) -> ShotRecord {
             check_updates: 0,
             bp_obs: o.bp_obs,
             esc_reason: o.esc_reason,
+            esc_margin: o.esc_margin,
+            esc_gap: o.esc_gap,
             smc_ran: o.smc_ran != 0,
             solvable: o.solvable != 0,
             rank: o.rank as u32,
@@ -194,6 +196,24 @@ impl GpuDecoder {
         p.p_nom_q12 = rt.upload(&layout.p_nom_q12)?;
         p.log_q16 = rt.upload(&layout.log_q16)?;
         p.llr_of_p = rt.upload(&layout.llr_of_p)?;
+        // mechanism classes (every table is padded to one element when there is no class)
+        fn padded<T: Copy + Default>(v: &[T]) -> Vec<T> {
+            if v.is_empty() {
+                vec![T::default()]
+            } else {
+                v.to_vec()
+            }
+        }
+        let n_cls = layout.n_cls();
+        ensure!(cfg.neuro.coincidence || n_cls == 0, "class tables without the coincidence estimator");
+        p.cls_ptr = rt.upload(&layout.cls_ptr)?;
+        p.cls_det = rt.upload(&padded(&layout.cls_det))?;
+        p.cls_span = rt.upload(&padded(&layout.cls_span))?;
+        p.cls_pi_q32 = rt.upload(&padded(&layout.cls_pi_q32))?;
+        p.cls_lnpi_q16 = rt.upload(&padded(&layout.cls_lnpi_q16))?;
+        p.cls_sup_ptr = rt.upload(&layout.cls_sup_ptr)?;
+        p.cls_sup = rt.upload(&padded(&layout.cls_sup))?;
+        p.mech_cls = rt.upload(&layout.mech_cls)?;
         // ---- per-stream monitor state
         let n_pairs = pairs.len();
         let bo = streams * layout.n_checks * QEC_R_MAX;
@@ -213,6 +233,8 @@ impl GpuDecoder {
         p.cur_bits = rt.alloc_zeroed(streams * wc * 8)?;
         p.pair_rate = rt.alloc_zeroed(streams * n_pairs * 4)?;
         p.explained = rt.alloc_zeroed(streams * n_pairs * 4)?;
+        p.cls_cnt = rt.alloc_zeroed((streams * n_cls * 2).max(8))?;
+        p.cls_rate = rt.alloc_zeroed((streams * n_cls * 4).max(8))?;
         // live DEM weights of every stream, contiguous: the persisting-L2 window
         let en_nom: Vec<i32> = layout.llr_nom.iter().map(|&l| qec_core::fixed::energy_from_llr(l)).collect();
         let mut live = Vec::with_capacity(streams * n_var);
@@ -281,6 +303,7 @@ impl GpuDecoder {
         p.n_checks = layout.n_checks as u32;
         p.layers = layout.layers as u32;
         p.n_pairs = n_pairs as u32;
+        p.n_cls = n_cls as u32;
         p.streams = streams as u32;
         p.steps = steps as u32;
         p.n_shots = n_shots as u32;
@@ -301,9 +324,13 @@ impl GpuDecoder {
         p.tau_margin = dc.esc.tau_margin;
         p.tau_gap = dc.esc.tau_gap;
         p.escalate = dc.esc.enabled as i32;
+        p.t_late = dc.esc.t_late as i32;
+        p.margin_gauge = dc.esc.margin_gauge as i32;
         p.beta_steps = dc.smc.beta_steps as i32;
         p.sweeps = dc.smc.sweeps as i32;
         p.quench_sweeps = dc.smc.quench_sweeps as i32;
+        p.pair_lambda = dc.smc.pair_lambda as i32;
+        p.pair_rounds = dc.smc.pair_rounds as i32;
         p.resample_q8 = dc.smc.resample_q8 as i32;
         p.tanh_max = TANH_MAX;
         p.twist_clip = TWIST_CLIP;
@@ -314,6 +341,11 @@ impl GpuDecoder {
         p.g_threshold = cfg.neuro.g_threshold as i32;
         p.g_threshold_hot = cfg.neuro.g_threshold_hot as i32;
         p.count_cap = cfg.neuro.count_cap as i32;
+        p.coincidence = cfg.neuro.coincidence as i32;
+        p.coin_cap = cfg.neuro.coin_cap as i32;
+        p.coin_min = cfg.neuro.coin_min as i32;
+        p.g_threshold_coin = cfg.neuro.g_threshold_coin as i32;
+        p.coin_snap = cfg.neuro.snap as i32;
         p.f2_engine = self.f2_engine;
         p.steps_per_launch = match mode {
             LaunchMode::Batch => 0,
@@ -415,7 +447,7 @@ pub fn record_mismatch(cpu: &ShotRecord, gpu: &ShotRecord, tol: f64) -> Option<S
         ($($f:ident),*) => { $( if a.$f != b.$f { return Some(format!("{}: cpu {:?} gpu {:?}", stringify!($f), a.$f, b.$f)); } )* };
     }
     exact!(
-        obs, bp_converged, bp_iters, bp_unsat, damped_steps, damped_mask, bp_obs, esc_reason, smc_ran, solvable, rank, n_free, piv_obs,
+        obs, bp_converged, bp_iters, bp_unsat, damped_steps, damped_mask, bp_obs, esc_reason, esc_margin, esc_gap, smc_ran, solvable, rank, n_free, piv_obs,
         piv_energy, best_energy, best_obs, q_obs, mode_obs, marginal_obs, energy_gap, bp_min_abs, resamples
     );
     let close = |x: f64, y: f64| (x == y) || (x - y).abs() <= tol * (1.0 + x.abs().min(y.abs()));

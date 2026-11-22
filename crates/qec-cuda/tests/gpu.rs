@@ -21,7 +21,7 @@ struct Bench {
 fn bench(p: f64) -> Bench {
     let code = bb72().build().unwrap();
     let (dem, cells) = Dem::phenomenological(&code, 5, p, p).unwrap();
-    let canon = CanonicalDecoderConfig::FROZEN_V1;
+    let canon = CanonicalDecoderConfig::ACTIVE;
     let cfg = canon.pipeline(dem.n_det, dem.n_err(), true);
     let layout = NeuroLayout::build(&dem, &cfg.neuro).unwrap();
     let graph = TannerGraph::from_complex(&ChainComplex::from_dem_cells(&dem, &cells).unwrap());
@@ -121,6 +121,42 @@ fn gpu_matches_the_cpu_reference_record_for_record() {
     for (shot, (c, g)) in cpu_static.iter().zip(gpu_static.iter()).enumerate() {
         assert!(record_mismatch(c, g, 1e-6).is_none(), "static-DEM run diverged at shot {shot}");
     }
+}
+
+/// The paths the active configuration leaves off must keep GPU/CPU parity too: pair
+/// exploration of the pivot relaxation, and the deprecated `FROZEN_V1` (pairwise monitor,
+/// gauge margin, late-convergence trigger).
+#[test]
+#[ignore]
+fn optional_and_deprecated_paths_keep_parity() {
+    let b = bench(0.006);
+    let (shots, plan) = drifting_shots(&b, 8, 24, 10, 21);
+    let mut gpu = decoder();
+    let mut paired = b.cfg;
+    paired.decoder.smc.pair_lambda = 48;
+    paired.decoder.smc.pair_rounds = 4;
+    let cpu = run_reference(&b.graph, &b.layout, &shots, &plan, &paired);
+    let (records, _) = gpu.decode(&b.graph, &b.layout, &paired, &shots, &plan, LaunchMode::Batch).unwrap();
+    let plain = run_reference(&b.graph, &b.layout, &shots, &plan, &b.cfg);
+    let mut moved = 0;
+    for (shot, (c, g)) in cpu.iter().zip(records.iter()).enumerate() {
+        if let Some(diff) = record_mismatch(c, g, 1e-6) {
+            panic!("pair exploration, shot {shot}: {diff}");
+        }
+        moved += (c.result.q_obs != plain[shot].result.q_obs || c.result.best_energy != plain[shot].result.best_energy) as usize;
+    }
+    eprintln!("[sm120] pair exploration changed {moved} of {} records", cpu.len());
+    let v1 = CanonicalDecoderConfig::FROZEN_V1.pipeline(b.dem.n_det, b.dem.n_err(), true);
+    let layout_v1 = NeuroLayout::build(&b.dem, &v1.neuro).unwrap();
+    let cpu = run_reference(&b.graph, &layout_v1, &shots, &plan, &v1);
+    let (records, tel) = gpu.decode(&b.graph, &layout_v1, &v1, &shots, &plan, LaunchMode::Batch).unwrap();
+    for (shot, (c, g)) in cpu.iter().zip(records.iter()).enumerate() {
+        if let Some(diff) = record_mismatch(c, g, 1e-6) {
+            panic!("FROZEN_V1, shot {shot}: {diff}");
+        }
+    }
+    assert!(cpu.iter().any(|r| r.report.modified_mechanisms > 0), "the FROZEN_V1 comparison must cover weight surgery");
+    assert_eq!(tel.host_syncs_in_decode_loop, 0);
 }
 
 #[test]

@@ -538,7 +538,8 @@ def cosmic_cluster(code, rng, target):
     return sorted(cluster)
 
 
-def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=500, onset_round=100):
+def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=500, onset_round=100,
+              hot_qubits=2, hot_mode="random"):
     """Non-stationary stream: every trace is `blocks` consecutive memory blocks whose noise
     changes at global round `onset_round` without telling any decoder (all receive the
     nominal DEM).
@@ -549,10 +550,16 @@ def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=
                probability 0.06 after CNOT step 3) and a cosmic-ray impact multiplies the idle
                error of a compact cluster of n/9 data qubits by 20, relaxing with a 60-round
                time constant (cut off after four time constants).
+
+    `hot_qubits` / `hot_mode` only change the `tls` experiment: the number of dropped-out data
+    qubits, drawn uniformly ("random") or as one compact cluster around a Z check ("cluster").
+    The defaults are the protocol's N1; any other choice is a tagged development variant.
     """
     code = get_code(code_id)
     n, n2, rounds = code["n"], code["n"] // 2, code["rounds"]
-    name = f"{code_id}_p{p:.4f}_drift_{experiment}"
+    variant = "" if (hot_qubits, hot_mode) == (2, "random") or experiment != "tls" else f"_k{hot_qubits}{hot_mode}"
+    name = f"{code_id}_p{p:.4f}_drift_{experiment}{variant}"
+    regime = experiment + variant
     out = Path(root) / "datasets" / name
     if (out / "meta.json").is_file():
         return name
@@ -566,16 +573,19 @@ def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=
     obs = np.zeros((traces * blocks, n_obs), dtype=np.bool_)
     pre = traces * onset_block
     if pre:
-        s = nominal.compile_detector_sampler(seed=derive_seed(domain, code_id, p, experiment, "nominal"))
+        s = nominal.compile_detector_sampler(seed=derive_seed(domain, code_id, p, regime, "nominal"))
         d0, o0 = s.sample(pre, separate_observables=True)
         for tr in range(traces):
             dets[tr * blocks: tr * blocks + onset_block] = d0[tr * onset_block:(tr + 1) * onset_block]
             obs[tr * blocks: tr * blocks + onset_block] = o0[tr * onset_block:(tr + 1) * onset_block]
     truth = []
     for tr in range(traces):
-        rng = np.random.default_rng(derive_seed(domain, code_id, p, experiment, "trace", tr))
+        rng = np.random.default_rng(derive_seed(domain, code_id, p, regime, "trace", tr))
         if experiment == "tls":
-            hot_q = sorted(int(q) for q in rng.choice(n, size=2, replace=False))
+            if hot_mode == "cluster":
+                hot_q = cosmic_cluster(code, rng, hot_qubits)
+            else:
+                hot_q = sorted(int(q) for q in rng.choice(n, size=hot_qubits, replace=False))
             xt_idx, tau, p_hot, p_xt = [], None, 0.25, 0.0
         elif experiment == "xtburst":
             hot_q = cosmic_cluster(code, rng, max(6, n // 9))
@@ -604,23 +614,95 @@ def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=
                     steady = (b, template.assemble(hot, act))
                 continue
             circ = template.assemble(hot, act)
-            s = circ.compile_detector_sampler(seed=derive_seed(domain, code_id, p, experiment, "blk", tr, b))
+            s = circ.compile_detector_sampler(seed=derive_seed(domain, code_id, p, regime, "blk", tr, b))
             d1, o1 = s.sample(1, separate_observables=True)
             dets[tr * blocks + b], obs[tr * blocks + b] = d1[0], o1[0]
         if steady is not None:
             b0, circ = steady
-            s = circ.compile_detector_sampler(seed=derive_seed(domain, code_id, p, experiment, "steady", tr))
+            s = circ.compile_detector_sampler(seed=derive_seed(domain, code_id, p, regime, "steady", tr))
             d1, o1 = s.sample(blocks - b0, separate_observables=True)
             dets[tr * blocks + b0:(tr + 1) * blocks] = d1
             obs[tr * blocks + b0:(tr + 1) * blocks] = o1
     write_dataset(out, code, nominal, dets, obs, {
         "kind": "drift_" + experiment, "regime": experiment, "p": p, "seed_domain": domain,
-        "stim_seed": derive_seed(domain, code_id, p, experiment, "nominal"),
+        "stim_seed": derive_seed(domain, code_id, p, regime, "nominal"),
+        "hot_qubits": hot_qubits if experiment == "tls" else None, "hot_mode": hot_mode if experiment == "tls" else None,
         "traces": traces, "blocks_per_trace": blocks, "onset_round": onset_round, "onset_block": onset_block,
         "onset_round_in_block": onset_round % rounds, "total_rounds": blocks * rounds,
         "xt_candidate_pairs": [list(x) for x in pairs]})
     (out / "drift_truth.json").write_text(json.dumps(truth, indent=1) + "\n")
     return name
+
+
+def dem_signatures(dem):
+    """(detectors, observables) signature -> merged probability, merged exactly as in
+    `dem_to_matrices`."""
+    out = {}
+    for inst in dem.flattened():
+        if inst.type != "error":
+            continue
+        pr = inst.args_copy()[0]
+        dets, obs = set(), set()
+        for t in inst.targets_copy():
+            if t.is_relative_detector_id():
+                dets ^= {t.val}
+            elif t.is_logical_observable_id():
+                obs ^= {t.val}
+        if not dets:
+            continue
+        key = (tuple(sorted(dets)), tuple(sorted(obs)))
+        out[key] = out[key] * (1 - pr) + pr * (1 - out[key]) if key in out else pr
+    return out
+
+
+def run_genie(ds_dir):
+    """Oracle-knowledge reference of a drift dataset: for every trace, the fault probability
+    of each mechanism under that trace's *true* drifted circuit, at the peak of the burst and
+    in the steady state after it.  A decoder handed these weights knows exactly which channels
+    drifted and by how much, so its logical error rate bounds what any online monitor can gain.
+    Blocks interpolate linearly with the mean burst scale of their rounds (exact for the
+    non-decaying `tls` experiment)."""
+    ds = Path(ds_dir)
+    meta = json.loads((ds / "meta.json").read_text())
+    assert meta["kind"].startswith("drift"), "the oracle-knowledge reference only exists for drift datasets"
+    code = get_code(meta["code"])
+    rounds, p = meta["rounds"], meta["p"]
+    pairs = [tuple(x) for x in meta["xt_candidate_pairs"]]
+    template = BbTemplate(code, rounds, p, pairs)
+    nominal = dem_signatures(template.assemble().detector_error_model(flatten_loops=True))
+    truth = json.loads((ds / "drift_truth.json").read_text())
+    onset_round, blocks = meta["onset_round"], meta["blocks_per_trace"]
+    tau = truth[0]["decay_tau_rounds"]
+    scale = []
+    for b in range(blocks):
+        acc = 0.0
+        for r in range(rounds):
+            g = b * rounds + r
+            if g < onset_round:
+                continue
+            acc += 1.0 if tau is None else (0.0 if g - onset_round >= 4.0 * tau else float(np.exp(-(g - onset_round) / tau)))
+        scale.append(acc / rounds)
+    active = [sum(1 for r in range(rounds) if b * rounds + r >= onset_round) / rounds for b in range(blocks)]
+    out_traces = []
+    for tr in truth:
+        hot_q = tr["hot_data_qubits"]
+        act = {r: {pairs.index(tuple(x)): tr["p_xt"] for x in tr["xt_pairs"]} for r in range(rounds)} if tr["xt_pairs"] else {}
+        peak_hot = {r: {q: tr["p_hot"] for q in hot_q} for r in range(rounds)}
+        peak = dem_signatures(template.assemble(peak_hot, act).detector_error_model(flatten_loops=True))
+        steady = peak if tau is None else dem_signatures(template.assemble({}, act).detector_error_model(flatten_loops=True))
+        assert set(peak) <= set(nominal) and set(steady) <= set(nominal), "drift created a mechanism the nominal model lacks"
+        mech = []
+        for key, p_nom in nominal.items():
+            p_peak, p_steady = peak.get(key, p_nom), steady.get(key, p_nom)
+            if abs(p_peak - p_nom) > 1e-3 * p_nom or abs(p_steady - p_nom) > 1e-3 * p_nom:
+                mech.append({"dets": list(key[0]), "obs": list(key[1]), "p_steady": p_steady, "p_peak": p_peak})
+        out_traces.append(mech)
+    doc = {"schema": "prism.qec.sota.v1.oracle_weights", "dataset": meta["name"], "burst_scale_per_block": scale,
+           "drift_active_fraction_per_block": active, "traces": out_traces}
+    (ds / "oracle_weights.json").write_text(json.dumps(doc) + "\n")
+    sizes = [len(m) for m in out_traces]
+    print(f"[genie] {meta['name']}: {len(out_traces)} traces, drifted mechanisms per trace min/mean/max = "
+          f"{min(sizes)}/{sum(sizes) / len(sizes):.1f}/{max(sizes)}", flush=True)
 
 
 # ----------------------------------------------------------------------------- baselines
@@ -820,11 +902,12 @@ def write_manifest(root, domain):
     (root / "oracle_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
 
 
-def run_calib(root, shots):
+def run_calib(root, shots, drift_traces=None):
     for code_id in ("bb72", "surface_d5"):
         gen_stationary(root, code_id, 0.002, shots, DOMAIN_CALIB)
-    gen_drift(root, "bb72", "tls", max(8, shots // 2000), DOMAIN_CALIB)
-    gen_drift(root, "bb72", "xtburst", max(8, shots // 2000), DOMAIN_CALIB)
+    traces = drift_traces if drift_traces else max(8, shots // 2000)
+    gen_drift(root, "bb72", "tls", traces, DOMAIN_CALIB)
+    gen_drift(root, "bb72", "xtburst", traces, DOMAIN_CALIB)
     write_manifest(root, DOMAIN_CALIB)
 
 
@@ -870,6 +953,7 @@ def main():
     c = sub.add_parser("calib")
     c.add_argument("--root", required=True)
     c.add_argument("--shots", type=int, default=20000)
+    c.add_argument("--drift-traces", type=int, default=0, help="traces of the drift datasets (0: shots // 2000)")
     g = sub.add_parser("campaign")
     g.add_argument("--root", required=True)
     g.add_argument("--shots", type=int, default=100000)
@@ -888,17 +972,33 @@ def main():
     bs.add_argument("--workers", type=int, default=6)
     bs.add_argument("--max-seconds", type=float, default=480.0)
     bs.add_argument("--only", nargs="*", default=[])
+    ge = sub.add_parser("genie", help="oracle-knowledge fault probabilities of a drift dataset")
+    ge.add_argument("--dataset", required=True)
+    dr = sub.add_parser("drift", help="development drift dataset (never the blind domain)")
+    dr.add_argument("--root", required=True)
+    dr.add_argument("--code", required=True, choices=("bb72", "bb144_gross"))
+    dr.add_argument("--experiment", required=True, choices=("tls", "xtburst"))
+    dr.add_argument("--traces", type=int, required=True)
+    dr.add_argument("--domain", required=True, choices=(DOMAIN_CALIB, "SMOKE_2026"))
+    dr.add_argument("--hot-qubits", type=int, default=2)
+    dr.add_argument("--hot-mode", choices=("random", "cluster"), default="random")
     args = ap.parse_args()
     if args.cmd == "selfcheck":
         selfcheck()
     elif args.cmd == "calib":
-        run_calib(args.root, args.shots)
+        run_calib(args.root, args.shots, args.drift_traces)
     elif args.cmd == "campaign":
         run_campaign(args.root, args.shots, args.traces72, args.traces144, args.only, args.domain)
     elif args.cmd == "baseline":
         run_baseline(args.dataset, args.decoder, args.workers, time.time() + args.max_seconds)
     elif args.cmd == "baselines":
         run_baselines(args.root, args.workers, args.max_seconds, args.only)
+    elif args.cmd == "genie":
+        run_genie(args.dataset)
+    elif args.cmd == "drift":
+        gen_drift(args.root, args.code, args.experiment, args.traces, args.domain,
+                  hot_qubits=args.hot_qubits, hot_mode=args.hot_mode)
+        write_manifest(args.root, args.domain)
     return 0
 
 

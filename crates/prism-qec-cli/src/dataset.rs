@@ -73,6 +73,54 @@ impl Dataset {
     }
 }
 
+/// Oracle-knowledge fault probabilities of a drift dataset (`oracle_weights.json`, written by
+/// `stim_bb_oracle.py genie`): what the drifted mechanisms of every trace really are.
+pub struct OracleWeights {
+    /// Per trace: `(mechanism, steady-state probability, burst-peak probability)`.
+    traces: Vec<Vec<(u32, f64, f64)>>,
+    burst_scale: Vec<f64>,
+    active: Vec<f64>,
+}
+
+impl OracleWeights {
+    pub fn load(dir: &Path, dem: &Dem) -> Result<Self> {
+        let path = dir.join("oracle_weights.json");
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).with_context(|| format!("reading {} (run `stim_bb_oracle.py genie`)", path.display()))?,
+        )?;
+        let index: std::collections::HashMap<(Vec<u32>, u64), u32> =
+            (0..dem.n_err()).map(|e| ((dem.dets(e).to_vec(), dem.err_obs[e]), e as u32)).collect();
+        let floats = |v: &Value| -> Vec<f64> { v.as_array().into_iter().flatten().filter_map(Value::as_f64).collect() };
+        let mut traces = Vec::new();
+        for tr in doc["traces"].as_array().into_iter().flatten() {
+            let mut list = Vec::new();
+            for m in tr.as_array().into_iter().flatten() {
+                let mut dets: Vec<u32> = m["dets"].as_array().into_iter().flatten().filter_map(|d| d.as_u64()).map(|d| d as u32).collect();
+                dets.sort_unstable();
+                let obs = m["obs"].as_array().into_iter().flatten().filter_map(|o| o.as_u64()).fold(0u64, |a, o| a | (1 << o));
+                let e = *index.get(&(dets, obs)).context("oracle weight refers to a mechanism the DEM lacks")?;
+                list.push((e, m["p_steady"].as_f64().unwrap_or(0.0), m["p_peak"].as_f64().unwrap_or(0.0)));
+            }
+            traces.push(list);
+        }
+        Ok(Self {
+            traces,
+            burst_scale: floats(&doc["burst_scale_per_block"]),
+            active: floats(&doc["drift_active_fraction_per_block"]),
+        })
+    }
+
+    /// Writes the true prior LLRs of block `block` of trace `trace` over the nominal ones.
+    pub fn apply(&self, trace: usize, block: usize, p_nom: &[f64], llr: &mut [i32]) {
+        let (active, scale) = (self.active.get(block).copied().unwrap_or(0.0), self.burst_scale.get(block).copied().unwrap_or(0.0));
+        for &(e, p_steady, p_peak) in self.traces.get(trace).map(Vec::as_slice).unwrap_or(&[]) {
+            let nom = p_nom[e as usize];
+            let p = nom + active * (p_steady - nom) + scale * (p_peak - p_steady);
+            llr[e as usize] = qec_core::fixed::llr_from_prob(p.clamp(0.0, 0.5));
+        }
+    }
+}
+
 /// Everything a decoder needs that is derived once per DEM.
 pub struct DecodeModel {
     pub graph: TannerGraph,

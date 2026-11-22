@@ -3,10 +3,11 @@
 //! `d1 e_hat == s` alone is **not** accepted as success.  A converged fast path is escalated
 //! into the slow path, with its own hard decision as the pivot, whenever
 //!
-//! * (a) convergence needed the damped phase (`t > T_clean`),
-//! * (b) the belief margin on the boundary of the decoded error is small
-//!   (`min |l_i| < tau_margin` over the decoded faults and the faults sharing a 2-cell with
-//!   them, i.e. their gauge alternatives), or
+//! * (a) convergence was late (`t > T_late`; `FROZEN_V1` used `T_late = T_clean`, `FROZEN_V2`
+//!   switches the trigger off: the damped phase resolving a gauge trap is not a risk),
+//! * (b) the belief margin of the decoded error is small (`min |l_i| < tau_margin` over the
+//!   decoded faults; `FROZEN_V1` also included the faults sharing a 2-cell with them, i.e.
+//!   their gauge alternatives, whose indecision is harmless), or
 //! * (c) a single 2-cell move `e_hat (+) d2 g` lowers the Nishimori energy or lands within
 //!   `tau_gap` of it (a competing valley).
 //!
@@ -31,12 +32,30 @@ pub struct EscalationConfig {
     pub tau_margin: i32,
     /// Competing-valley threshold `tau_gap` in SMC energy units.
     pub tau_gap: i32,
+    /// Iteration count above which a converged fast path counts as late.
+    pub t_late: u32,
+    /// Whether the margin also covers the gauge alternatives of the decoded faults (the
+    /// `FROZEN_V1` definition) or only the decoded faults themselves.
+    pub margin_gauge: bool,
 }
 
 impl Default for EscalationConfig {
     fn default() -> Self {
-        Self { enabled: true, tau_margin: 96, tau_gap: 16 }
+        Self { enabled: true, tau_margin: 96, tau_gap: 16, t_late: 16, margin_gauge: true }
     }
+}
+
+/// Value of [`ShotResult::esc_margin`] / [`ShotResult::esc_gap`] when the hard decision is
+/// empty (nothing to be unsure about).
+pub const ESC_NONE: i32 = i32::MAX;
+
+/// Soft margins of a converged hard decision (`post < 0` are the decoded faults).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftMargin {
+    /// Smallest belief magnitude over the decoded faults and their gauge alternatives.
+    pub margin: i32,
+    /// Smallest Nishimori energy change of a single 2-cell move `e_hat (+) d2 g`.
+    pub gap: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -62,6 +81,9 @@ pub struct ShotResult {
     pub bp_obs: u64,
     /// Nonzero iff a converged fast path was escalated (`ESC_*` flags).
     pub esc_reason: u8,
+    /// Soft margins of a converged fast path ([`ESC_NONE`] when not converged or empty).
+    pub esc_margin: i32,
+    pub esc_gap: i32,
     /// True iff the slow path ran (non-converged or escalated).
     pub smc_ran: bool,
     /// False iff the syndrome is outside the span of the suspect columns.
@@ -116,6 +138,41 @@ impl ShotResult {
             self.min_abs_df
         }
     }
+
+    /// Logical coset posterior mass outside the decided class, `1 - W(L_MAP) / sum_L W(L)`
+    /// over the terminal walker population (0 when the slow path did not run).
+    pub fn mass_split(&self) -> f64 {
+        if self.smc_ran && self.solvable {
+            (1.0 - (-self.mode_free_energy).exp()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `FROZEN_V2` herald: risk = coset mass split + the fraction of the `n_chk` checks the
+    /// fast path left unsatisfied (the soft syndrome the walkers had to close); ties are
+    /// broken by the walkers' energy gap between the decided coset and the best other one.
+    /// The Pareto `k_hat` is not used: measured, it carries no information about failure.
+    /// Returned as a confidence (larger = more trustworthy), `+inf` for an accepted fast path.
+    pub fn confidence_v2(&self, n_chk: usize) -> f64 {
+        if !self.smc_ran {
+            f64::INFINITY
+        } else if !self.solvable {
+            -2.0 * PARETO_REJECT_OFFSET
+        } else {
+            let risk = self.mass_split() + self.bp_unsat as f64 / n_chk.max(1) as f64;
+            -risk + 1e-9 * self.energy_gap.clamp(0, 1 << 20) as f64
+        }
+    }
+
+    /// Herald confidence under functional `mode` (0: `FROZEN_V1`, otherwise `FROZEN_V2`).
+    pub fn herald_confidence(&self, mode: u32, khat_max: f64, n_chk: usize) -> f64 {
+        if mode == 0 {
+            self.confidence(khat_max)
+        } else {
+            self.confidence_v2(n_chk)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,31 +188,33 @@ pub struct CosetDecoder<'g> {
     pub tables: SmcTables,
 }
 
-/// Escalation triggers (b) and (c) for a converged hard decision `post < 0`.
-pub fn escalation_flags(g: &TannerGraph, post: &[i32], en: &[i32], esc: &EscalationConfig) -> u8 {
-    let mut flags = 0u8;
+/// Soft margins behind escalation triggers (b) and (c) for a converged hard decision.
+/// `gauge` extends the margin to the faults sharing a 2-cell with a decoded fault.
+pub fn soft_margin(g: &TannerGraph, post: &[i32], en: &[i32], gauge: bool) -> SoftMargin {
+    let mut m = SoftMargin { margin: ESC_NONE, gap: ESC_NONE };
     for v in 0..g.n_var {
         if post[v] >= 0 {
             continue;
         }
-        if post[v].abs() < esc.tau_margin {
-            flags |= ESC_MARGIN;
-        }
+        m.margin = m.margin.min(post[v].abs());
         for &f in g.var_cells(v) {
             let mut delta = 0i32;
             for &u in g.cell_vars(f as usize) {
                 let u = u as usize;
-                if post[u].abs() < esc.tau_margin {
-                    flags |= ESC_MARGIN;
+                if gauge {
+                    m.margin = m.margin.min(post[u].abs());
                 }
                 delta += if post[u] < 0 { -en[u] } else { en[u] };
             }
-            if delta < esc.tau_gap {
-                flags |= ESC_VALLEY;
-            }
+            m.gap = m.gap.min(delta);
         }
     }
-    flags
+    m
+}
+
+/// Escalation triggers (b) and (c) from the soft margins.
+pub fn escalation_flags(m: SoftMargin, esc: &EscalationConfig) -> u8 {
+    (if m.margin < esc.tau_margin { ESC_MARGIN } else { 0 }) | (if m.gap < esc.tau_gap { ESC_VALLEY } else { 0 })
 }
 
 impl<'g> CosetDecoder<'g> {
@@ -180,14 +239,18 @@ impl<'g> CosetDecoder<'g> {
             bp_obs,
             solvable: true,
             min_abs_df: f64::INFINITY,
+            esc_margin: ESC_NONE,
+            esc_gap: ESC_NONE,
             ..ShotResult::default()
         };
         if out.converged {
+            let m = soft_margin(g, &work.bp.post, en, self.cfg.esc.margin_gauge);
+            (res.esc_margin, res.esc_gap) = (m.margin, m.gap);
             if self.cfg.esc.enabled {
-                if out.iterations > self.cfg.bp.t_clean {
+                if out.iterations > self.cfg.esc.t_late {
                     res.esc_reason |= ESC_LATE;
                 }
-                res.esc_reason |= escalation_flags(g, &work.bp.post, en, &self.cfg.esc);
+                res.esc_reason |= escalation_flags(m, &self.cfg.esc);
             }
             if res.esc_reason == 0 {
                 return res;
@@ -199,7 +262,7 @@ impl<'g> CosetDecoder<'g> {
         let order: &[i32] = if out.converged { &work.bp.post } else { &work.bp.snap };
         res.bp_min_abs = order.iter().map(|x| x.abs()).min().unwrap_or(0);
         let pivot =
-            build_pivot(g, en, order, syndrome, self.cfg.smc.k_cols, self.cfg.smc.quench_sweeps, &mut work.pivot);
+            build_pivot(g, en, order, syndrome, self.cfg.smc.k_cols, self.cfg.smc.relax(), &mut work.pivot);
         res.rank = pivot.rank as u32;
         res.n_free = pivot.n_free() as u32;
         res.solvable = pivot.solvable;

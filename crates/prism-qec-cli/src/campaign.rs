@@ -1,9 +1,9 @@
 //! The blind-holdout campaign: every dataset below a root is decoded on the RTX 5080 under
-//! `FROZEN_V1` on the exact shots the BP-OSD / BP-LSD baselines decoded, compared pairwise,
+//! the frozen configuration on the exact shots the BP-OSD / BP-LSD baselines decoded, compared pairwise,
 //! and summarised in `qec_frontier_receipt.json` (then sealed).  Nothing in the receipt is
 //! entered by hand: every number is computed here from the shot files and decoder outputs.
 
-use crate::dataset::{Dataset, DecodeModel};
+use crate::dataset::{Dataset, DecodeModel, OracleWeights};
 use crate::stats::{clopper_pearson, mcnemar_exact, mcnemar_worse};
 use anyhow::{bail, ensure, Context, Result};
 use qec_core::bb::spec_by_name;
@@ -12,8 +12,8 @@ use qec_core::fixed::PRIOR_CLIP;
 use qec_core::merkle::write_seal;
 use qec_cuda::{record_mismatch, GpuDecoder, GpuTelemetry, LaunchMode};
 use qec_neuro_dem::{
-    run_reference, run_reference_with_weights, CanonicalDecoderConfig, PipelineConfig, ShotRecord, StreamPlan,
-    SEED_DOMAIN_BLIND,
+    run_reference, run_reference_oracle, run_reference_with_weights, CanonicalDecoderConfig, PipelineConfig, ShotRecord,
+    StreamPlan, SEED_DOMAIN_BLIND,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -32,6 +32,10 @@ pub struct CampaignArgs {
     pub latency_shots_other: usize,
     pub streams: usize,
     pub sealed_utc: String,
+    /// Explicit operator release of the blind-holdout domain.
+    pub release_blind: bool,
+    /// The frozen configuration under evaluation.
+    pub frozen: CanonicalDecoderConfig,
 }
 
 /// Baseline outputs of one decoder on one dataset.
@@ -145,7 +149,20 @@ fn decode_with_parity(
     Ok(Decoded { records, telemetry, parity_shots: cpu.len(), parity_mismatches: mismatches, first_mismatch: first })
 }
 
-fn write_predictions(ds_dir: &Path, tag: &str, n_obs: usize, records: &[ShotRecord]) -> Result<()> {
+/// Herald functional of the configuration under evaluation, with the model size it needs.
+#[derive(Clone, Copy)]
+struct Herald {
+    mode: u32,
+    n_chk: usize,
+}
+
+impl Herald {
+    fn confidence(&self, r: &ShotRecord) -> f64 {
+        r.result.herald_confidence(self.mode, 0.7, self.n_chk)
+    }
+}
+
+fn write_predictions(ds_dir: &Path, tag: &str, n_obs: usize, records: &[ShotRecord], herald: Herald) -> Result<()> {
     let dir = ds_dir.join("prism");
     std::fs::create_dir_all(&dir)?;
     let mut bits = ShotBits::zeros(records.len(), n_obs);
@@ -153,7 +170,7 @@ fn write_predictions(ds_dir: &Path, tag: &str, n_obs: usize, records: &[ShotReco
         bits.shot_mut(s)[0] = r.result.obs;
     }
     std::fs::write(dir.join(format!("{tag}.pred.b8")), bits.to_b8_bytes())?;
-    let conf: Vec<u8> = records.iter().flat_map(|r| (r.result.confidence(0.7) as f32).to_le_bytes()).collect();
+    let conf: Vec<u8> = records.iter().flat_map(|r| (herald.confidence(r) as f32).to_le_bytes()).collect();
     std::fs::write(dir.join(format!("{tag}.confidence.f32")), conf)?;
     let flags: Vec<u8> = records
         .iter()
@@ -238,7 +255,7 @@ fn drift_counts(ds: &Dataset, plan: &StreamPlan, obs: &[u64]) -> (usize, usize, 
 
 /// Pair-level precision / recall of the activated crosstalk hyperedges of an `xtburst`
 /// dataset against the oracle's ground truth, from every trace's final live weights.
-fn crosstalk_edge_scores(ds: &Dataset, ds_dir: &Path, model: &DecodeModel, live_llr: &[i32], traces: usize) -> Result<Value> {
+pub fn crosstalk_edge_scores(ds: &Dataset, ds_dir: &Path, model: &DecodeModel, live_llr: &[i32], traces: usize) -> Result<Value> {
     let truth: Value = serde_json::from_str(&std::fs::read_to_string(ds_dir.join("drift_truth.json"))?)?;
     let code = spec_by_name(ds.code_id())?.build()?;
     let hz_t = code.hz.transpose();
@@ -314,8 +331,9 @@ fn drift_dataset(
     let on = decode_with_parity(gpu, ds, model, &cfg_on, &plan, args.parity_shots)?;
     let live = gpu.last_live_llr.clone();
     let off = decode_with_parity(gpu, ds, model, &cfg_off, &plan, args.parity_shots)?;
-    write_predictions(ds_dir, "neuro_on", n_obs, &on.records)?;
-    write_predictions(ds_dir, "neuro_off", n_obs, &off.records)?;
+    let herald = Herald { mode: frozen.hle_mode, n_chk: model.graph.n_chk };
+    write_predictions(ds_dir, "neuro_on", n_obs, &on.records, herald)?;
+    write_predictions(ds_dir, "neuro_off", n_obs, &off.records, herald)?;
     let obs_on: Vec<u64> = on.records.iter().map(|r| r.result.obs).collect();
     let obs_off: Vec<u64> = off.records.iter().map(|r| r.result.obs).collect();
     let (on_all, n, on_post, post_n) = drift_counts(ds, &plan, &obs_on);
@@ -365,6 +383,18 @@ fn drift_dataset(
                               "neuro_off": {"shots_compared": off.parity_shots, "mismatches": off.parity_mismatches, "first_mismatch": off.first_mismatch}},
         "host_syncs_in_decode_loop": on.telemetry.host_syncs_in_decode_loop + off.telemetry.host_syncs_in_decode_loop,
     });
+    if ds_dir.join("oracle_weights.json").is_file() {
+        // reference on the CPU pipeline: the decoder handed the true drifted weights of every
+        // block, i.e. the bound on what any online monitor can gain
+        let oracle = OracleWeights::load(ds_dir, &ds.dem)?;
+        let recs = run_reference_oracle(&model.graph, &model.layout, &ds.dets, &plan, &cfg_off, |trace, block, llr| {
+            oracle.apply(trace, block, &model.layout.p_nom, llr)
+        });
+        let obs_or: Vec<u64> = recs.iter().map(|r| r.result.obs).collect();
+        let (or_all, _, or_post, _) = drift_counts(ds, &plan, &obs_or);
+        report["errors"]["prism_oracle_weights"] = json!(or_all);
+        report["post_onset_errors"]["prism_oracle_weights"] = json!(or_post);
+    }
     let mut bocpd_only_errors = None;
     if with_bocpd_only {
         // ablation on the CPU reference: changepoint filters without transfer entropy
@@ -408,11 +438,11 @@ fn drift_experiment(parts: &[DriftPart], description: &str) -> Value {
     out
 }
 
-fn hle_frontier(ds: &Dataset, dec: &Decoded, bposd: &Baseline) -> Value {
+fn hle_frontier(ds: &Dataset, dec: &Decoded, bposd: &Baseline, herald: Herald) -> Value {
     let n = dec.records.len();
     let prism_fail: Vec<bool> = (0..n).map(|s| dec.records[s].result.obs != ds.truth(s)).collect();
     let osd_fail: Vec<bool> = (0..n).map(|s| bposd.pred[s] != ds.truth(s)).collect();
-    let hle: Vec<f64> = dec.records.iter().map(|r| r.result.confidence(0.7)).collect();
+    let hle: Vec<f64> = dec.records.iter().map(|r| herald.confidence(r)).collect();
     let gap: Vec<f64> = dec.records.iter().map(|r| if r.result.smc_ran { r.result.min_abs_df } else { f64::INFINITY }).collect();
     // BP-OSD soft gap: smallest posterior |LLR| on the decoded faults; and the classic
     // "BP did not converge, then heaviest solution first" ordering
@@ -439,7 +469,11 @@ fn hle_frontier(ds: &Dataset, dec: &Decoded, bposd: &Baseline) -> Value {
     json!({
         "dataset": ds.name, "code_id": ds.code_id(), "p": ds.noise_p(), "shots": n,
         "unselected": {"prism_errors": prism_fail.iter().filter(|&&f| f).count(), "bposd_errors": osd_fail.iter().filter(|&&f| f).count()},
-        "prism_hle_order": "fast-path accepted shots last; Pareto-rejected (k_hat > 0.7) slow-path shots first, then by min_j |Delta F_j|",
+        "prism_hle_order": if herald.mode == 0 {
+            "fast-path accepted shots last; Pareto-rejected (k_hat > 0.7) slow-path shots first, then by min_j |Delta F_j|"
+        } else {
+            "fast-path accepted shots last; slow-path shots by coset mass split 1 - W(L_MAP)/sum_L W(L) plus unsatisfied-check fraction, ties by walker energy gap"
+        },
         "points": points,
     })
 }
@@ -456,11 +490,13 @@ fn latency_run(gpu: &mut GpuDecoder, ds: &Dataset, model: &DecodeModel, cfg: &Pi
 }
 
 pub fn run(args: &CampaignArgs) -> Result<()> {
-    let frozen = CanonicalDecoderConfig::FROZEN_V1;
+    let frozen = args.frozen;
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(args.root.join("oracle_manifest.json"))?)?;
     let domain = manifest["seed_domain"].as_str().context("manifest without seed_domain")?.to_string();
     ensure!(domain != qec_neuro_dem::SEED_DOMAIN_CALIB, "the calibration domain must not be evaluated as a campaign");
-    if domain != SEED_DOMAIN_BLIND {
+    if domain == SEED_DOMAIN_BLIND {
+        ensure!(args.release_blind, "{SEED_DOMAIN_BLIND} is quarantined: pass --release-blind once the frozen configuration is final");
+    } else {
         println!("[campaign] NOTE: evaluating seed domain {domain}, not {SEED_DOMAIN_BLIND}");
     }
     let names: Vec<String> = manifest["datasets"].as_array().context("manifest without datasets")?.iter().filter_map(|v| v.as_str().map(String::from)).collect();
@@ -504,7 +540,8 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         let cfg = frozen.pipeline(ds.dem.n_det, ds.dem.n_err(), true);
         let plan = ds.plan(args.streams, Some(bposd.shots));
         let dec = decode_with_parity(&mut gpu, &ds, &model, &cfg, &plan, args.parity_shots)?;
-        write_predictions(&ds_dir, "frozen_v1", n_obs, &dec.records)?;
+        let herald = Herald { mode: frozen.hle_mode, n_chk: model.graph.n_chk };
+        write_predictions(&ds_dir, &frozen.config_id().to_lowercase(), n_obs, &dec.records, herald)?;
         host_syncs += dec.telemetry.host_syncs_in_decode_loop;
         parity_shots += dec.parity_shots;
         parity_mismatches += dec.parity_mismatches;
@@ -517,7 +554,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             t0.elapsed().as_secs_f64()
         );
         if ds.code_id() == "bb144_gross" && ds.noise_p() >= 0.0025 {
-            hle.push(hle_frontier(&ds, &dec, &bposd));
+            hle.push(hle_frontier(&ds, &dec, &bposd, herald));
         }
         // streaming latency at the headline noise point
         if (ds.noise_p() - 0.003).abs() < 1e-9 {
@@ -570,9 +607,15 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         "green_ctx_sms": [info.sm_fast, info.sm_slow],
         "host_syncs_in_decode_loop": host_syncs,
         "config_lock": {
-            "config_id": CanonicalDecoderConfig::CONFIG_ID, "config_sha256": frozen.sha256(),
+            "config_id": frozen.config_id(), "config_sha256": frozen.sha256(),
             "canonical_text": frozen.canonical_text(),
-            "calibration_seed_domain": qec_neuro_dem::SEED_DOMAIN_CALIB, "calibration_datasets": ["bb72 p=0.002", "surface_d5 p=0.002"],
+            "calibration_seed_domain": qec_neuro_dem::SEED_DOMAIN_CALIB,
+            "calibration_datasets": if frozen.version <= 1 {
+                json!(["bb72 p=0.002", "surface_d5 p=0.002"])
+            } else {
+                json!(["bb72 p=0.002", "surface_d5 p=0.002", "bb72 p=0.0015 drift tls (400 traces)", "bb72 p=0.0015 drift xtburst (400 traces)"])
+            },
+            "development_cross_check_seed_domain": if frozen.version <= 1 { Value::Null } else { json!(qec_neuro_dem::SEED_DOMAIN_SMOKE) },
             "eval_seed_domain": domain, "per_code_tuning": false,
             "suspect_budget_rule": "k_cols = ceil(n_det * 256 / 256) rounded up to a multiple of 64, floor 128",
         },
@@ -606,6 +649,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         "baselines": manifest["baseline_config"],
         "disclosures": [
             "Decoder design and early parameter exploration used development shots of bb72 and bb144_gross at p = 0.003 (dev seed, disjoint from both seed domains) before the protocol was adopted; FROZEN_V1 values were then set on CALIB_2026 only.",
+            "FROZEN_V2 was developed after FROZEN_V1 had been measured on CALIB_2026 and SMOKE_2026 shots (bb72, bb144_gross, surface_d5, hgp_hamming); its values were chosen on CALIB_2026 and cross-checked on SMOKE_2026. No PRISM decode of a BLIND_HOLDOUT_2026 shot took place before the configuration was frozen; the CLI refuses blind datasets outside this campaign.",
             "The reported decision is the maximum-weight coset; errors of the forest, minimum-energy-walker and bitwise-marginal rules on the same shots are listed per cell.",
             "PRISM latency is GPU wall time; baseline latency is single-thread CPU time measured while other baseline workers were running.",
             "Escalated fast paths reuse the reliability-ordered pivot (their decoded faults lead the suspect list); the pivot is not free.",

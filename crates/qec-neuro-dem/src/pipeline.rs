@@ -108,6 +108,53 @@ pub fn run_reference_with_weights(
     (records, weights)
 }
 
+/// Oracle-knowledge reference: no monitor runs; `weights(stream, step, llr)` overwrites
+/// entries of `llr` (pre-filled with the nominal model) with the true prior LLRs of that
+/// block.  The logical error rate of this run bounds what any online monitor can gain.
+pub fn run_reference_oracle<F>(
+    graph: &TannerGraph,
+    layout: &NeuroLayout,
+    dets: &ShotBits,
+    plan: &StreamPlan,
+    cfg: &PipelineConfig,
+    weights: F,
+) -> Vec<ShotRecord>
+where
+    F: Fn(usize, usize, &mut [i32]) + Sync,
+{
+    let dec = CosetDecoder::new(graph, cfg.decoder);
+    let per_stream: Vec<Vec<(usize, ShotRecord)>> = (0..plan.streams)
+        .into_par_iter()
+        .map(|stream| {
+            let mut work = DecodeWork::default();
+            let mut llr = layout.llr_nom.clone();
+            let mut en = vec![0i32; llr.len()];
+            let mut out = Vec::with_capacity(plan.steps);
+            for step in 0..plan.steps {
+                let Some(shot) = plan.shot(stream, step) else { continue };
+                llr.copy_from_slice(&layout.llr_nom);
+                weights(stream, step, &mut llr);
+                for (e, &l) in en.iter_mut().zip(&llr) {
+                    *e = qec_core::fixed::energy_from_llr(l);
+                }
+                let t0 = Instant::now();
+                let result = dec.decode(&mut work, &llr, &en, dets.shot(shot), shot as u32);
+                let report = BlockReport {
+                    modified_mechanisms: llr.iter().zip(&layout.llr_nom).filter(|(a, b)| a != b).count() as u32,
+                    ..BlockReport::default()
+                };
+                out.push((shot, ShotRecord { result, report, latency_ns: t0.elapsed().as_nanos() as u64 }));
+            }
+            out
+        })
+        .collect();
+    let mut records = vec![ShotRecord::default(); plan.n_shots];
+    for (shot, rec) in per_stream.into_iter().flatten() {
+        records[shot] = rec;
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

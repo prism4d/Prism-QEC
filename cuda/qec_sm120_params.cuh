@@ -46,6 +46,15 @@ typedef struct QecParams {
     unsigned long long p_nom_q12;   // i32[n_var]
     unsigned long long log_q16;     // i32[256]
     unsigned long long llr_of_p;    // i32[2049]
+    // mechanism classes of the k-point coincidence estimator (n_cls may be 0)
+    unsigned long long cls_ptr;     // u32[n_cls + 1]
+    unsigned long long cls_det;     // u32[class nnz]: check | layer offset << 12
+    unsigned long long cls_span;    // u8[n_cls]: layers spanned (1 or 2)
+    unsigned long long cls_pi_q32;  // u32[n_cls]: nominal coincidence rate
+    unsigned long long cls_lnpi_q16; // i32[n_cls]
+    unsigned long long cls_sup_ptr; // u32[n_cls + 1]
+    unsigned long long cls_sup;     // u32[containment nnz]
+    unsigned long long mech_cls;    // u32[n_var]: class of a mechanism or 0xFFFFFFFF
     // ---- per-stream monitor state ----------------------------------------------------------
     unsigned long long bo_r;        // f64[streams * n_checks * QEC_R_MAX]
     unsigned long long bo_b;        // f64[streams * n_checks * QEC_R_MAX]
@@ -59,6 +68,8 @@ typedef struct QecParams {
     unsigned long long cur_bits;    // u64[streams * wc]
     unsigned long long pair_rate;   // i32[streams * n_pairs]
     unsigned long long explained;   // i32[streams * n_pairs]
+    unsigned long long cls_cnt;     // u8[streams * n_cls * 2]: matches, exposure
+    unsigned long long cls_rate;    // i32[streams * n_cls]
     unsigned long long llr;         // i32[streams * n_var]   live prior LLRs (the L2-pinned DEM)
     unsigned long long en;          // i32[streams * n_var]   live Nishimori weights
     // ---- per-stream fast-path state --------------------------------------------------------
@@ -107,16 +118,18 @@ typedef struct QecParams {
     double khat_max;
     // ---- sizes -----------------------------------------------------------------------------
     unsigned int n_chk, n_var, n_edge, n_cell, n_obs;
-    unsigned int n_checks, layers, n_pairs;
+    unsigned int n_checks, layers, n_pairs, n_cls;
     unsigned int streams, steps, n_shots, stream_major;
     unsigned int ws, wc, wr, wm, wz;
     unsigned int k_cols, walkers, smc_blocks;
     // ---- frozen decoder parameters ---------------------------------------------------------
     int t_max, t_clean, alpha_q8, eta_q8, margin;
-    int tau_margin, tau_gap, escalate;
+    int tau_margin, tau_gap, escalate, t_late, margin_gauge;
     int beta_steps, sweeps, quench_sweeps, resample_q8;
+    int pair_lambda, pair_rounds; // reliability-ordered pair exploration of the pivot relaxation
     int tanh_max, twist_clip, metro_len, en_one;
     int neuro_on, n_min, g_threshold, g_threshold_hot, count_cap;
+    int coincidence, coin_cap, coin_min, g_threshold_coin, coin_snap; // k-point coincidence estimator
     int f2_engine; // 0: __popcll(a & b) & 1, 1: .b1 and.popc tensor-core path
     int steps_per_launch; // fast-loop time steps per graph launch (0: all of them)
 } QecParams;
@@ -157,6 +170,8 @@ typedef struct QecShotOut {
     int resamples;
     int modified_mechanisms;
     int hot_checks;
+    int esc_margin;                  // soft margins of a converged fast path (INT_MAX: none)
+    int esc_gap;
     unsigned char bp_converged;
     unsigned char esc_reason;
     unsigned char smc_ran;
