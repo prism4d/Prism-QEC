@@ -1,5 +1,15 @@
 //! Core F2 cellular chain-complex, Bivariate Bicycle qLDPC, and dual-Merkle primitives.
 
+// Index-driven loops mirror the CUDA kernels statement for statement.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
+pub mod bb;
+pub mod complex;
+pub mod dem;
+pub mod f2;
+pub mod fixed;
+pub mod merkle;
+
 /// Verifies the fundamental CSS / space-time chain-complex identity d1 * d2 == 0 (mod 2)
 /// on dense row-major bit-packed or byte matrices `[m_rows x n_cols]` and `[n_cols x p_cols]`.
 pub fn check_chain_boundary_zero(d1: &[u8], m_rows: usize, n_cols: usize, d2: &[u8], p_cols: usize) -> bool {

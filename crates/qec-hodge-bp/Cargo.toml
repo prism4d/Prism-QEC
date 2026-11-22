@@ -1,0 +1,10 @@
+[package]
+name = "qec-hodge-bp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+qec-core = { workspace = true }

@@ -2,6 +2,11 @@
 resolver = "2"
 members = [
     "crates/qec-core",
+    "crates/qec-hodge-bp",
+    "crates/qec-smc-coset",
+    "crates/qec-neuro-dem",
+    "crates/qec-cuda",
+    "crates/prism-qec-cli",
 ]
 
 [workspace.package]
@@ -9,3 +14,28 @@ version = "0.1.0"
 edition = "2021"
 license = "Proprietary"
 authors = ["Ididia J. Serfaty <is@delfictus.com>"]
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+cc = "1"
+qec-core = { path = "crates/qec-core" }
+qec-hodge-bp = { path = "crates/qec-hodge-bp" }
+qec-smc-coset = { path = "crates/qec-smc-coset" }
+qec-neuro-dem = { path = "crates/qec-neuro-dem" }
+qec-cuda = { path = "crates/qec-cuda" }
+
+[profile.dev]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+debug = false
+overflow-checks = false

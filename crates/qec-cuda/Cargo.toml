@@ -1,0 +1,18 @@
+[package]
+name = "qec-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+qec-core = { workspace = true }
+qec-hodge-bp = { workspace = true }
+qec-smc-coset = { workspace = true }
+qec-neuro-dem = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
