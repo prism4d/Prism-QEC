@@ -249,10 +249,7 @@ if len(s.get("merkle_root_sha256", "")) != 64 or len(s.get("merkle_root_blake3",
     errs.append("invalid dual SHA-256 + BLAKE3 Merkle roots")
 
 if errs:
-    sys.stderr.write("[GATE-4 COMMERCIAL SOTA AUDIT FAILED]:
-  - " + "
-  - ".join(errs) + "
-")
+    sys.stderr.write("[GATE-4 COMMERCIAL SOTA AUDIT FAILED]:\n  - " + "\n  - ".join(errs) + "\n")
     sys.exit(1)
 print("[GATE-4 COMMERCIAL SOTA RECEIPT & DUAL MERKLE SEAL VERIFIED]")
 PY
