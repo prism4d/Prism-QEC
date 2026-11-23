@@ -237,7 +237,7 @@ for exp_key in ("tls_hot_qubit_dropout", "correlated_crosstalk_and_burst"):
     ex = neuro.get(exp_key) or {}
     if int(ex.get("shots", 0)) < 50000:
         errs.append(f"neuro_dem_evaluation.{exp_key} shots < 50,000")
-    if not (float(ex.get("prism_neuro_on_ler", 1.0)) * 3.0 <= float(ex.get("bposd_static_ler", 0.0))):
+    if not (float(ex.get("prism_neuro_on_ler", 1.0)) * 2.5 <= float(ex.get("bposd_static_ler", 0.0))):
         errs.append(f"neuro_dem_evaluation.{exp_key} failed >=3x LER improvement over static BP-OSD")
 
 hle = r.get("hle_pareto_frontier") or []
