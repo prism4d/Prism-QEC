@@ -183,6 +183,50 @@ fn write_predictions(ds_dir: &Path, tag: &str, n_obs: usize, records: &[ShotReco
     Ok(())
 }
 
+/// Decode-path shot counts, weight-register totals and worst-case sequential depths of a run.
+fn path_telemetry(records: &[ShotRecord]) -> Value {
+    let (mut fast, mut slow, mut unsolv, mut sampled) = (0usize, 0usize, 0usize, 0usize);
+    let (mut armed, mut write_blocks, mut writes) = (0usize, 0usize, 0u64);
+    let (mut max_iters, mut max_span, mut max_resamples) = (0u32, 0u32, 0u32);
+    for rec in records {
+        let r = &rec.result;
+        fast += r.fast_accepted() as usize;
+        slow += r.smc_ran as usize;
+        unsolv += (r.smc_ran && !r.solvable) as usize;
+        sampled += r.smc_sampled as usize;
+        armed += rec.report.armed as usize;
+        write_blocks += (rec.report.weight_writes > 0) as usize;
+        writes += rec.report.weight_writes as u64;
+        max_iters = max_iters.max(r.bp_iters);
+        max_span = max_span.max(r.piv_span);
+        max_resamples = max_resamples.max(r.resamples);
+    }
+    json!({
+        "path_counts": {"fast_path": fast, "osd_quench_exit": slow - unsolv - sampled, "full_smc": sampled, "unsolvable": unsolv},
+        "dem_registers": {"blocks": records.len(), "blocks_armed": armed, "blocks_with_writes": write_blocks, "weight_writes": writes},
+        "worst_case_depth": {"bp_iterations": max_iters, "elimination_columns": max_span, "resampling_events": max_resamples},
+    })
+}
+
+/// Weight-register activity of a trace-structured run before the onset block (the stationary
+/// part of every trace) and from it on.
+fn register_split(plan: &StreamPlan, onset: usize, records: &[ShotRecord]) -> Value {
+    // blocks, armed, with writes, writes
+    let mut reg = [[0u64; 4]; 2];
+    for tr in 0..plan.streams {
+        for blk in 0..plan.steps {
+            let Some(rec) = plan.shot(tr, blk).and_then(|shot| records.get(shot)) else { continue };
+            let side = &mut reg[(blk >= onset) as usize];
+            side[0] += 1;
+            side[1] += rec.report.armed as u64;
+            side[2] += (rec.report.weight_writes > 0) as u64;
+            side[3] += rec.report.weight_writes as u64;
+        }
+    }
+    let side = |r: [u64; 4]| json!({"blocks": r[0], "blocks_armed": r[1], "blocks_with_writes": r[2], "weight_writes": r[3]});
+    json!({"stationary_pre_onset": side(reg[0]), "post_onset": side(reg[1])})
+}
+
 fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseline) -> Value {
     let n = dec.records.len();
     let truth: Vec<u64> = (0..n).map(|s| ds.truth(s)).collect();
@@ -190,19 +234,11 @@ fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseli
     let (mut pe, mut oe, mut le, mut wins, mut losses, mut wins_l, mut losses_l) = (0, 0, 0, 0u64, 0u64, 0u64, 0u64);
     let (mut fp_false, mut fast, mut esc, mut slow, mut unsolv, mut hle, mut khat_rej) = (0, 0, 0, 0, 0, 0, 0);
     let (mut f_forest, mut f_best, mut f_marg) = (0, 0, 0);
-    let (mut sampled, mut armed_blocks, mut write_blocks, mut writes) = (0usize, 0usize, 0usize, 0u64);
-    let (mut max_iters, mut max_span, mut max_resamples) = (0u32, 0u32, 0u32);
+    let tele = path_telemetry(&dec.records);
     // fast-path false convergences on which the baselines fail too / return the same class
     let (mut fp_osd_wrong, mut fp_osd_same, mut fp_lsd_wrong) = (0usize, 0usize, 0usize);
     for (s, rec) in dec.records.iter().enumerate() {
         let r = &rec.result;
-        sampled += r.smc_sampled as usize;
-        armed_blocks += rec.report.armed as usize;
-        write_blocks += (rec.report.weight_writes > 0) as usize;
-        writes += rec.report.weight_writes as u64;
-        max_iters = max_iters.max(r.bp_iters);
-        max_span = max_span.max(r.piv_span);
-        max_resamples = max_resamples.max(r.resamples);
         let (p, o, l) = (fail(r.obs, s), fail(bposd.pred[s], s), fail(bplsd.pred[s], s));
         pe += p as usize;
         oe += o as usize;
@@ -241,9 +277,7 @@ fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseli
         "fast_path_accepted": fast, "fast_path_false_converged": fp_false, "fast_path_escalated": esc,
         "slow_path_shots": slow, "slow_path_unsolvable": unsolv, "hle_flagged": hle, "khat_rejected": khat_rej,
         "fast_path_false_converged_attribution": {"bposd_also_wrong": fp_osd_wrong, "bposd_same_wrong_class": fp_osd_same, "bplsd_also_wrong": fp_lsd_wrong},
-        "path_counts": {"fast_path": fast, "osd_quench_exit": slow - unsolv - sampled, "full_smc": sampled, "unsolvable": unsolv},
-        "dem_registers": {"blocks": n, "blocks_armed": armed_blocks, "blocks_with_writes": write_blocks, "weight_writes": writes},
-        "worst_case_depth": {"bp_iterations": max_iters, "elimination_columns": max_span, "resampling_events": max_resamples},
+        "path_counts": tele["path_counts"], "dem_registers": tele["dem_registers"], "worst_case_depth": tele["worst_case_depth"],
         "alternative_decisions": {"forest_errors": f_forest, "min_energy_walker_errors": f_best, "bitwise_marginal_errors": f_marg},
         "bposd_bp_converged_fraction": bposd.summary["bp_converged_fraction"],
         "gpu": {"shots_per_sec": dec.telemetry.shots_per_sec, "wall_seconds": dec.telemetry.wall_seconds,
@@ -370,18 +404,10 @@ fn drift_dataset(
     let onset = ds.meta_usize("onset_block").unwrap_or(0);
     let mut reaction = Vec::new();
     let mut pre_surgery = 0usize;
-    // weight-register activity before / after the onset block: blocks, armed, with writes, writes
-    let mut reg = [[0u64; 4]; 2];
     for tr in 0..plan.streams {
         let mut first = None;
         for blk in 0..plan.steps {
-            let rep = &on.records[plan.shot(tr, blk).unwrap_or(0)].report;
-            let side = &mut reg[(blk >= onset) as usize];
-            side[0] += 1;
-            side[1] += rep.armed as u64;
-            side[2] += (rep.weight_writes > 0) as u64;
-            side[3] += rep.weight_writes as u64;
-            let touched = rep.modified_mechanisms > 0;
+            let touched = on.records[plan.shot(tr, blk).unwrap_or(0)].report.modified_mechanisms > 0;
             if blk < onset {
                 pre_surgery += touched as usize;
             } else if touched && first.is_none() {
@@ -405,10 +431,7 @@ fn drift_dataset(
         "prism_on_wins_bposd_fails": wins, "prism_on_fails_bposd_wins": losses, "mcnemar_p_value": mcnemar_exact(losses, wins),
         "monitor": {
             "traces_with_surgery": reaction.len(), "pre_onset_blocks_with_surgery": pre_surgery,
-            "dem_registers": {
-                "stationary_pre_onset": {"blocks": reg[0][0], "blocks_armed": reg[0][1], "blocks_with_writes": reg[0][2], "weight_writes": reg[0][3]},
-                "post_onset": {"blocks": reg[1][0], "blocks_armed": reg[1][1], "blocks_with_writes": reg[1][2], "weight_writes": reg[1][3]},
-            },
+            "dem_registers": register_split(&plan, onset, &on.records),
             "median_blocks_from_onset_block_to_first_surgery": median_blocks,
             "median_rounds_from_onset_to_first_surgery_upper_bound": median_blocks.map(|b| (b + 1) * rounds),
         },
@@ -573,8 +596,13 @@ pub fn audit(ds_dir: &Path, frozen: &CanonicalDecoderConfig, parity_shots: usize
     let dec = decode_with_parity(&mut gpu, &ds, &model, &cfg, &plan, plan.n_shots)?;
     let mean = |v: &[u64]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
     let slow = dec.records.iter().filter(|r| r.result.smc_ran).count();
+    let tele = path_telemetry(&dec.records);
+    let prism_errors = dec.records.iter().enumerate().filter(|(s, r)| r.result.obs != ds.truth(*s)).count();
     let mut out = json!({
         "dataset": ds.name, "seed_domain": ds.seed_domain(), "config_id": frozen.config_id(), "config_sha256": frozen.sha256(),
+        "logical_errors": {"shots": plan.n_shots, "prism_gpu": prism_errors},
+        "path_counts": tele["path_counts"], "dem_registers": tele["dem_registers"], "worst_case_depth": tele["worst_case_depth"],
+        "kernel_footprint": kernel_footprint(),
         "gpu_vs_cpu_parity": {"shots_compared": dec.parity_shots, "mismatches": dec.parity_mismatches, "first_mismatch": dec.first_mismatch},
         "batch": {
             "shots": plan.n_shots, "slow_path_shots": slow, "shots_per_sec": dec.telemetry.shots_per_sec,
@@ -588,6 +616,20 @@ pub fn audit(ds_dir: &Path, frozen: &CanonicalDecoderConfig, parity_shots: usize
     let n_obs = ds.dem.n_obs;
     let bposd = load_baseline(ds_dir, "bposd", n_obs).ok();
     let bplsd = load_baseline(ds_dir, "bplsd", n_obs).ok();
+    for (key, base) in [("bposd", &bposd), ("bplsd", &bplsd)] {
+        if let Some(b) = base {
+            // a baseline may cover a prefix of the dataset only: its count then names its shots
+            let n = plan.n_shots.min(b.pred.len());
+            out["logical_errors"][key] = json!((0..n).filter(|&s| b.pred[s] != ds.truth(s)).count());
+            if n < plan.n_shots {
+                out["logical_errors"][format!("{key}_shots")] = json!(n);
+            }
+        }
+    }
+    if plan.stream_major {
+        let onset = ds.meta_usize("onset_block").context("trace-structured dataset without onset_block")?;
+        out["dem_registers_by_onset"] = register_split(&plan, onset, &dec.records);
+    }
     if let Some(b) = &bposd {
         out["batch"]["throughput_speedup_vs_bposd_single_thread"] = json!(dec.telemetry.shots_per_sec * mean(&b.lat_ns) / 1e9);
     }
