@@ -18,8 +18,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "prism-qec", version, about = "PRISM-QEC: damped min-sum + Nishimori coset SMC decoder")]
 struct Cli {
-    /// Frozen configuration: `v3` (active) or the deprecated `v1` / `v2`.
-    #[arg(long, global = true, value_enum, default_value_t = Frozen::V3)]
+    /// Frozen configuration: `v4` (active) or the deprecated `v1` / `v2` / `v3`.
+    #[arg(long, global = true, value_enum, default_value_t = Frozen::V4)]
     frozen: Frozen,
     #[command(subcommand)]
     cmd: Cmd,
@@ -30,6 +30,7 @@ enum Frozen {
     V1,
     V2,
     V3,
+    V4,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +217,10 @@ pub struct Overrides {
     /// instead of the monitor: the bound on what any online monitor can gain.
     #[arg(long)]
     pub oracle_weights: bool,
+    /// With `--oracle-weights`: true drift locations but the burst envelope replaced by its
+    /// post-onset mean (diagnostic of what timing knowledge is worth).
+    #[arg(long)]
+    pub oracle_flat_burst: bool,
     #[arg(long, value_enum, default_value_t = Decision::Mode)]
     pub decision: Decision,
 }
@@ -262,7 +267,7 @@ fn run_and_report(
     }
     println!("records_digest={}", cpu::records_digest(&run.results));
     if let Some(path) = dump {
-        cpu::dump_csv(path, ds, &run.records)?;
+        cpu::dump_csv(path, ds, &run.records, canon.hle_mode, cfg.decoder.smc.khat_max, model.graph.n_chk)?;
     }
     println!(
         "latency_ns={} wall={:.2}s cells={} k_cols={}",
@@ -290,6 +295,7 @@ fn main() -> Result<()> {
         Frozen::V1 => CanonicalDecoderConfig::FROZEN_V1,
         Frozen::V2 => CanonicalDecoderConfig::FROZEN_V2,
         Frozen::V3 => CanonicalDecoderConfig::FROZEN_V3,
+        Frozen::V4 => CanonicalDecoderConfig::FROZEN_V4,
     };
     match cli.cmd {
         Cmd::Config => {
@@ -341,7 +347,13 @@ fn main() -> Result<()> {
             cfg.decoder.esc.enabled = !over.no_escalation;
             cfg.decoder.bp.wavefront = !over.flooding;
             println!("development config sha256={} ({} is {})", canon.sha256(), frozen.config_id(), frozen.sha256());
-            let oracle = if over.oracle_weights { Some(dataset::OracleWeights::load(&dataset, &ds.dem)?) } else { None };
+            let oracle = if over.oracle_weights {
+                let mut o = dataset::OracleWeights::load(&dataset, &ds.dem)?;
+                o.flat_burst = over.oracle_flat_burst;
+                Some(o)
+            } else {
+                None
+            };
             run_and_report(&dataset, &ds, &canon, &cfg, shots, over.decision, over.dump.as_deref(), oracle.as_ref())?;
         }
         Cmd::CpuDecode { dataset, shots, static_dem, dump } => {

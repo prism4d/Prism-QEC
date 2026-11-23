@@ -165,12 +165,30 @@ impl ShotResult {
         }
     }
 
-    /// Herald confidence under functional `mode` (0: `FROZEN_V1`, otherwise `FROZEN_V2`).
-    pub fn herald_confidence(&self, mode: u32, khat_max: f64, n_chk: usize) -> f64 {
-        if mode == 0 {
-            self.confidence(khat_max)
+    /// `FROZEN_V4` herald: the `FROZEN_V2` risk plus the Nishimori weight of the decoded
+    /// solution in nats per check.  All three terms are dimensionless and enter with unit
+    /// weight: coset mass outside the decided class, fraction of checks the fast path left
+    /// unsatisfied, solution weight per check.
+    pub fn confidence_v4(&self, n_chk: usize) -> f64 {
+        if !self.smc_ran {
+            f64::INFINITY
+        } else if !self.solvable {
+            -2.0 * PARETO_REJECT_OFFSET
         } else {
-            self.confidence_v2(n_chk)
+            let per_chk = n_chk.max(1) as f64;
+            let weight = self.best_energy as f64 / qec_core::fixed::EN_ONE as f64 / per_chk;
+            let risk = self.mass_split() + self.bp_unsat as f64 / per_chk + weight;
+            -risk + 1e-9 * self.energy_gap.clamp(0, 1 << 20) as f64
+        }
+    }
+
+    /// Herald confidence under functional `mode` (0: `FROZEN_V1`, 1: `FROZEN_V2` / `V3`,
+    /// otherwise `FROZEN_V4`).
+    pub fn herald_confidence(&self, mode: u32, khat_max: f64, n_chk: usize) -> f64 {
+        match mode {
+            0 => self.confidence(khat_max),
+            1 => self.confidence_v2(n_chk),
+            _ => self.confidence_v4(n_chk),
         }
     }
 }

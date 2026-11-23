@@ -279,24 +279,32 @@ pub fn records_digest(results: &[ShotResult]) -> String {
 
 /// Writes one CSV row per shot (decisions, energies, certificate values, monitor reaction) for
 /// offline failure analysis against the baseline outputs of the same shots.
-pub fn dump_csv(path: &std::path::Path, ds: &Dataset, records: &[ShotRecord]) -> std::io::Result<()> {
+pub fn dump_csv(
+    path: &std::path::Path,
+    ds: &Dataset,
+    records: &[ShotRecord],
+    hle_mode: u32,
+    khat_max: f64,
+    n_chk: usize,
+) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         w,
         "shot,truth,obs,bp_obs,piv_obs,q_obs,best_obs,mode_obs,marginal_obs,bp_converged,bp_iters,bp_unsat,esc_reason,\
          smc_ran,solvable,rank,n_free,piv_energy,best_energy,energy_gap,mode_free_energy,min_abs_df,khat,ess,bp_min_abs,\
-         resamples,damped_steps,modified,hot_checks,esc_margin,esc_gap"
+         resamples,damped_steps,modified,hot_checks,esc_margin,esc_gap,confidence"
     )?;
     for (s, rec) in records.iter().enumerate() {
         let r = &rec.result;
         writeln!(
             w,
-            "{s},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{s},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             ds.truth(s), r.obs, r.bp_obs, r.piv_obs, r.q_obs, r.best_obs, r.mode_obs, r.marginal_obs, r.bp_converged as u8,
             r.bp_iters, r.bp_unsat, r.esc_reason, r.smc_ran as u8, r.solvable as u8, r.rank, r.n_free, r.piv_energy,
             r.best_energy, r.energy_gap, r.mode_free_energy, r.min_abs_df, r.khat, r.ess, r.bp_min_abs, r.resamples,
-            r.damped_steps, rec.report.modified_mechanisms, rec.report.hot_checks, r.esc_margin, r.esc_gap
+            r.damped_steps, rec.report.modified_mechanisms, rec.report.hot_checks, r.esc_margin, r.esc_gap,
+            r.herald_confidence(hle_mode, khat_max, n_chk)
         )?;
     }
     w.flush()

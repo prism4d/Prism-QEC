@@ -470,10 +470,10 @@ fn hle_frontier(ds: &Dataset, dec: &Decoded, bposd: &Baseline, herald: Herald) -
     json!({
         "dataset": ds.name, "code_id": ds.code_id(), "p": ds.noise_p(), "shots": n,
         "unselected": {"prism_errors": prism_fail.iter().filter(|&&f| f).count(), "bposd_errors": osd_fail.iter().filter(|&&f| f).count()},
-        "prism_hle_order": if herald.mode == 0 {
-            "fast-path accepted shots last; Pareto-rejected (k_hat > 0.7) slow-path shots first, then by min_j |Delta F_j|"
-        } else {
-            "fast-path accepted shots last; slow-path shots by coset mass split 1 - W(L_MAP)/sum_L W(L) plus unsatisfied-check fraction, ties by walker energy gap"
+        "prism_hle_order": match herald.mode {
+            0 => "fast-path accepted shots last; Pareto-rejected (k_hat > 0.7) slow-path shots first, then by min_j |Delta F_j|",
+            1 => "fast-path accepted shots last; slow-path shots by coset mass split 1 - W(L_MAP)/sum_L W(L) plus unsatisfied-check fraction, ties by walker energy gap",
+            _ => "fast-path accepted shots last; slow-path shots by coset mass split 1 - W(L_MAP)/sum_L W(L) plus unsatisfied-check fraction plus solution weight in nats per check, ties by walker energy gap",
         },
         "points": points,
     })
@@ -657,6 +657,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         "baselines": manifest["baseline_config"],
         "disclosures": [
             "Decoder design and early parameter exploration used development shots of bb72 and bb144_gross at p = 0.003 (dev seed, disjoint from both seed domains) before the protocol was adopted; FROZEN_V1 values were then set on CALIB_2026 only.",
+            "FROZEN_V4 = FROZEN_V3 plus the herald with solution weight per check; decoder, monitor and kernels are unchanged. It was set on CALIB_2026 only, with no blind shot decoded. On the CALIB_2026 crosstalk-plus-burst sets the monitor reached 2.76x (bb72) and 4.3x (bb144_gross) over static BP-OSD, 3.06x pooled; three monitor variants built to raise that (pooled fast amplitude, hot-region prior, shorter windows) moved it by 3% or less and were not adopted.",
             "FROZEN_V3 = FROZEN_V2 plus the full-column pivot. It was developed after FROZEN_V2 lost to BP-OSD on bb144_gross development shots; its new values and every inherited value were validated on CALIB_2026 only (bb72, surface_d5, bb144_gross, hgp_hamming). The drift generator (profile 2) was re-scaled on CALIB_2026 so that static BP-OSD has a usable error floor on bb144_gross before any blind drift set was generated.",
             "FROZEN_V2 was developed after FROZEN_V1 had been measured on CALIB_2026 and SMOKE_2026 shots (bb72, bb144_gross, surface_d5, hgp_hamming); its values were chosen on CALIB_2026 and cross-checked on SMOKE_2026. No PRISM decode of a BLIND_HOLDOUT_2026 shot took place before the configuration was frozen; the CLI refuses blind datasets outside this campaign.",
             "The reported decision is the maximum-weight coset; errors of the forest, minimum-energy-walker and bitwise-marginal rules on the same shots are listed per cell.",

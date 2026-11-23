@@ -1,8 +1,8 @@
 //! The immutable decoder configurations.
 //!
 //! Every dimensionless solver parameter lives in one frozen constant whose SHA-256 identity is
-//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V3`] is the active one;
-//! `FROZEN_V1` and `FROZEN_V2` are deprecated and stay reachable (same behaviour, same identity
+//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V4`] is the active one;
+//! `FROZEN_V1`, `FROZEN_V2` and `FROZEN_V3` are deprecated and stay reachable (same behaviour, same identity
 //! hash as when they were frozen).  Development may inspect only datasets of the `CALIB_2026`
 //! seed domain (`SMOKE_2026` shots only exercise the pipeline); datasets of the `BLIND_HOLDOUT_2026` domain are
 //! decoded with the active constant and nothing else: there is no per-code, per-distance or
@@ -189,14 +189,30 @@ impl CanonicalDecoderConfig {
         ..Self::FROZEN_V2
     };
 
+    /// Identity hash `FROZEN_V3` had when it was frozen.
+    pub const FROZEN_V3_SHA256: &'static str = "0f5cfeb9262f61e0848dfdd9bbc0bf76dbde3bf2e7bc659d1ba2c0cabc87fa6e";
+
+    /// `FROZEN_V3` with the herald that adds the solution weight per check (`hle_mode = 2`).
+    /// Decoder, monitor and SM120 kernels are those of `FROZEN_V3`: every decoded observable
+    /// is identical, only the post-selection order changes.  Frozen on `CALIB_2026` only.
+    ///
+    /// Three monitor variants were built and measured for this version on the `CALIB_2026`
+    /// crosstalk-plus-burst sets and rejected, because none moved the result by more than 3%:
+    /// a pooled fast amplitude over the long-window rates, a hot-region prior from the
+    /// changepoint multipliers, and shorter coincidence windows.  A decode with the true burst
+    /// locations but only the time-averaged burst amplitude is within 12% of the decode with
+    /// exact weights, so the remaining gap is locating the burst qubits, not timing.
+    pub const FROZEN_V4: Self = Self { version: 4, hle_mode: 2, ..Self::FROZEN_V3 };
+
     /// The configuration every evaluation uses unless a deprecated one is requested.
-    pub const ACTIVE: Self = Self::FROZEN_V3;
+    pub const ACTIVE: Self = Self::FROZEN_V4;
 
     pub fn config_id(&self) -> &'static str {
         match self.version {
             0 | 1 => "FROZEN_V1",
             2 => "FROZEN_V2",
-            _ => "FROZEN_V3",
+            3 => "FROZEN_V3",
+            _ => "FROZEN_V4",
         }
     }
 
@@ -365,7 +381,14 @@ mod tests {
     fn identity_hash_is_stable_and_sensitive_to_every_field() {
         let base = CanonicalDecoderConfig::FROZEN_V1;
         assert_eq!(base.sha256(), CanonicalDecoderConfig::FROZEN_V1_SHA256);
-        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V3"));
+        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V4"));
+        let v4 = CanonicalDecoderConfig::FROZEN_V4;
+        assert_eq!(CanonicalDecoderConfig::FROZEN_V3.sha256(), CanonicalDecoderConfig::FROZEN_V3_SHA256);
+        assert_ne!(v4.sha256(), CanonicalDecoderConfig::FROZEN_V3_SHA256);
+        // FROZEN_V4 changes the herald only: decoder and monitor are those of FROZEN_V3
+        let prev = CanonicalDecoderConfig::FROZEN_V3;
+        assert_eq!((v4.decoder(936, 8784), v4.neuro()), (prev.decoder(936, 8784), prev.neuro()));
+        assert_eq!((v4.hle_mode, prev.hle_mode), (2, 1));
         let v2 = CanonicalDecoderConfig::FROZEN_V2;
         assert_eq!((v2.config_id(), v2.sha256().as_str()), ("FROZEN_V2", CanonicalDecoderConfig::FROZEN_V2_SHA256));
         let v3 = CanonicalDecoderConfig::FROZEN_V3;

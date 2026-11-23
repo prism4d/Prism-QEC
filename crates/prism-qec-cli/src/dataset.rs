@@ -80,6 +80,9 @@ pub struct OracleWeights {
     traces: Vec<Vec<(u32, f64, f64)>>,
     burst_scale: Vec<f64>,
     active: Vec<f64>,
+    /// Diagnostic: replace the burst envelope by its post-onset mean (true locations, no
+    /// knowledge of the timing).
+    pub flat_burst: bool,
 }
 
 impl OracleWeights {
@@ -107,12 +110,18 @@ impl OracleWeights {
             traces,
             burst_scale: floats(&doc["burst_scale_per_block"]),
             active: floats(&doc["drift_active_fraction_per_block"]),
+            flat_burst: false,
         })
     }
 
     /// Writes the true prior LLRs of block `block` of trace `trace` over the nominal ones.
     pub fn apply(&self, trace: usize, block: usize, p_nom: &[f64], llr: &mut [i32]) {
-        let (active, scale) = (self.active.get(block).copied().unwrap_or(0.0), self.burst_scale.get(block).copied().unwrap_or(0.0));
+        let active = self.active.get(block).copied().unwrap_or(0.0);
+        let mut scale = self.burst_scale.get(block).copied().unwrap_or(0.0);
+        if self.flat_burst && active > 0.0 {
+            let post: Vec<f64> = self.burst_scale.iter().zip(&self.active).filter(|(_, a)| **a > 0.0).map(|(s, _)| *s).collect();
+            scale = post.iter().sum::<f64>() / post.len().max(1) as f64;
+        }
         for &(e, p_steady, p_peak) in self.traces.get(trace).map(Vec::as_slice).unwrap_or(&[]) {
             let nom = p_nom[e as usize];
             let p = nom + active * (p_steady - nom) + scale * (p_peak - p_steady);
