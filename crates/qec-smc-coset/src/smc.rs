@@ -34,6 +34,9 @@ pub struct SmcConfig {
     /// Reliability-ordered pair exploration: chords considered and pair moves allowed.
     pub pair_lambda: u32,
     pub pair_rounds: u32,
+    /// Full-column pivot: every fault enters the elimination and `k_cols` is the number of
+    /// free coordinates kept (smallest exact gain first) instead of the suspect prefix.
+    pub full_columns: bool,
     /// Resample when `ESS < W * resample_q8 / 256` (0 = never: plain annealed importance sampling).
     pub resample_q8: u32,
     /// HLE threshold on the herald risk (see `ShotResult::hle_risk`).
@@ -53,6 +56,7 @@ impl Default for SmcConfig {
             quench_sweeps: 8,
             pair_lambda: 0,
             pair_rounds: 0,
+            full_columns: false,
             resample_q8: 128,
             tau_cert: 1.0,
             khat_max: 0.7,

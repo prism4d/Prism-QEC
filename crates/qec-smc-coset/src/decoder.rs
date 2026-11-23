@@ -15,7 +15,7 @@
 //! faults lead the suspect list and the forest solution reproduces `e_hat` (whenever its
 //! columns are independent).  Non-converged shots use the beliefs of the unperturbed prefix.
 
-use crate::pivot::{build_pivot, PivotScratch};
+use crate::pivot::{build_pivot, build_pivot_full, PivotScratch};
 use crate::smc::{run_smc, SmcConfig, SmcTables};
 use qec_hodge_bp::{BpConfig, BpWork, HodgeBp, TannerGraph};
 
@@ -261,8 +261,12 @@ impl<'g> CosetDecoder<'g> {
         // lead the suspect list), the unperturbed-prefix beliefs otherwise
         let order: &[i32] = if out.converged { &work.bp.post } else { &work.bp.snap };
         res.bp_min_abs = order.iter().map(|x| x.abs()).min().unwrap_or(0);
-        let pivot =
-            build_pivot(g, en, order, syndrome, self.cfg.smc.k_cols, self.cfg.smc.relax(), &mut work.pivot);
+        let smc_cfg = &self.cfg.smc;
+        let pivot = if smc_cfg.full_columns {
+            build_pivot_full(g, en, order, syndrome, smc_cfg.k_cols, smc_cfg.relax(), &mut work.pivot)
+        } else {
+            build_pivot(g, en, order, syndrome, smc_cfg.k_cols, smc_cfg.relax(), &mut work.pivot)
+        };
         res.rank = pivot.rank as u32;
         res.n_free = pivot.n_free() as u32;
         res.solvable = pivot.solvable;

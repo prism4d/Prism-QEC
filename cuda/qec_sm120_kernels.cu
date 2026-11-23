@@ -719,20 +719,30 @@ extern "C" __global__ void qec_bp_decode(const QecParams* P)
         out->solvable = 1;
         out->hle = 0;
         if (slow) {
-            // stable counting sort of the K least reliable faults, ties by index
-            const u32 k_cols = P->k_cols;
             const u32 slot = atomicAdd(&ctrl[QEC_CTRL_NREC], 1u);
-            u32* rec_list = (u32*)P->rec_list + (u64)slot * k_cols;
-            int* rec_en = P_I32(rec_en) + (u64)slot * k_cols;
             ((u32*)P->rec_shot)[slot] = shot;
-            for (u32 b = 0; b < QEC_BUCKETS; ++b) sh_hist[b + 1] += sh_hist[b];
-            for (u32 v = 0; v < n_var; ++v) {
-                int b = (order[v] >> 3) + 512;
-                b = b < 0 ? 0 : (b > QEC_BUCKETS - 1 ? QEC_BUCKETS - 1 : b);
-                const u32 at = sh_hist[b]++;
-                if (at < k_cols) {
-                    rec_list[at] = v;
-                    rec_en[at] = en[v];
+            if (P->full_columns) {
+                // every fault goes to the slow path: reliability bucket | Nishimori weight << 10
+                u32* rec = (u32*)P->rec_list + (u64)slot * n_var;
+                for (u32 v = 0; v < n_var; ++v) {
+                    int b = (order[v] >> 3) + 512;
+                    b = b < 0 ? 0 : (b > QEC_BUCKETS - 1 ? QEC_BUCKETS - 1 : b);
+                    rec[v] = (u32)b | ((u32)en[v] << 10);
+                }
+            } else {
+                // stable counting sort of the K least reliable faults, ties by index
+                const u32 k_cols = P->k_cols;
+                u32* rec_list = (u32*)P->rec_list + (u64)slot * k_cols;
+                int* rec_en = P_I32(rec_en) + (u64)slot * k_cols;
+                for (u32 b = 0; b < QEC_BUCKETS; ++b) sh_hist[b + 1] += sh_hist[b];
+                for (u32 v = 0; v < n_var; ++v) {
+                    int b = (order[v] >> 3) + 512;
+                    b = b < 0 ? 0 : (b > QEC_BUCKETS - 1 ? QEC_BUCKETS - 1 : b);
+                    const u32 at = sh_hist[b]++;
+                    if (at < k_cols) {
+                        rec_list[at] = v;
+                        rec_en[at] = en[v];
+                    }
                 }
             }
         }
@@ -930,6 +940,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     __shared__ int sh_i[8];
     __shared__ u64 sh_obs;
     __shared__ long long sh_pair;
+    __shared__ u32 sh_hist[QEC_BUCKETS + 1];
     const u32 tid = threadIdx.x, nt = blockDim.x, blk = blockIdx.x;
     u32* ctrl = (u32*)P->ctrl;
     const u32 rec = ctrl[QEC_CTRL_CURSOR] + blk;
@@ -937,6 +948,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     const u32 shot = ((const u32*)P->rec_shot)[rec];
     const u32 n_chk = P->n_chk, n_var = P->n_var, k_cols = P->k_cols, n_obs = P->n_obs;
     const u32 wr = P->wr, wm = P->wm, wz = P->wz, nw = P->walkers;
+    const u32 k_list = P->k_list; // columns handed to the pivot: the k_cols suspects, or every fault
     const u32* list = (const u32*)P->rec_list + (u64)rec * k_cols;
     const int* rec_en = P_I32(rec_en) + (u64)rec * k_cols;
     const u64* syn = P_U64(syn) + (u64)shot * P->ws;
@@ -969,10 +981,31 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     const u32* metro = P_U32(metropolis);
     QecShotOut* out = (QecShotOut*)P->out + shot;
 
+    if (P->full_columns) {
+        // full-column mode: stable counting sort of every fault by reliability bucket
+        const u32* packed = (const u32*)P->rec_list + (u64)rec * n_var;
+        u32* slist = (u32*)P->s_list + (u64)blk * n_var;
+        int* slen = P_I32(s_len) + (u64)blk * n_var;
+        for (u32 b = tid; b <= QEC_BUCKETS; b += nt) sh_hist[b] = 0u;
+        __syncthreads();
+        for (u32 v = tid; v < n_var; v += nt) atomicAdd(&sh_hist[(packed[v] & 1023u) + 1u], 1u);
+        __syncthreads();
+        if (tid == 0u) {
+            for (u32 b = 0; b < QEC_BUCKETS; ++b) sh_hist[b + 1] += sh_hist[b];
+            for (u32 v = 0; v < n_var; ++v) {
+                const u32 at = sh_hist[packed[v] & 1023u]++;
+                slist[at] = v;
+                slen[at] = (int)(packed[v] >> 10);
+            }
+        }
+        __syncthreads();
+        list = slist;
+        rec_en = slen;
+    }
     // ---- suspect positions and the augmented matrix [H_K | s]
     for (u32 v = tid; v < n_var; v += nt) pos[v] = -1;
     __syncthreads();
-    for (u32 j = tid; j < k_cols; j += nt) pos[list[j]] = (int)j;
+    for (u32 j = tid; j < k_list; j += nt) pos[list[j]] = (int)j;
     __syncthreads();
     for (u32 c = tid; c < n_chk; c += nt) {
         u64* row = mat + (u64)c * wm;
@@ -981,16 +1014,18 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
             int j = pos[chk_var[e]];
             if (j >= 0) row[j >> 6] |= 1ULL << (j & 63);
         }
-        if (get_bit(syn, c)) row[k_cols >> 6] |= 1ULL << (k_cols & 63);
+        if (get_bit(syn, c)) row[k_list >> 6] |= 1ULL << (k_list & 63);
         pivcol[c] = -1;
     }
     if (tid == 0u) {
         sh_piv[0] = QEC_INT_MAX;
         sh_piv[1] = QEC_INT_MAX;
+        sh_i[5] = 0; // pivots found so far
     }
     __syncthreads();
     // ---- Gauss-Jordan in reliability order, lowest unused row as pivot
-    for (u32 j = 0; j < k_cols; ++j) {
+    for (u32 j = 0; j < k_list; ++j) {
+        if (sh_i[5] == (int)n_chk) break; // every row has its pivot
         const u32 w = j >> 6;
         const u64 m = 1ULL << (j & 63);
         for (u32 r = tid; r < n_chk; r += nt) {
@@ -1011,7 +1046,10 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
             }
         }
         if (tid == 0u) {
-            if (pr != QEC_INT_MAX) pivcol[pr] = (int)j;
+            if (pr != QEC_INT_MAX) {
+                pivcol[pr] = (int)j;
+                sh_i[5] += 1;
+            }
             sh_piv[(j + 1u) & 1u] = QEC_INT_MAX;
         }
         __syncthreads();
@@ -1019,7 +1057,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     // ---- consistency, forest solution, weight bit-planes
     for (u32 q = tid; q < QEC_EN_BITS * wr; q += nt) planes[q] = 0ULL;
     for (u32 q = tid; q < wr; q += nt) epiv[q] = 0ULL;
-    for (u32 j = tid; j < k_cols; j += nt) pos[j] = 1;
+    for (u32 j = tid; j < k_list; j += nt) pos[j] = 1;
     if (tid == 0u) {
         sh_i[0] = 1; // solvable
         sh_i[1] = 0; // energy of the forest solution
@@ -1031,7 +1069,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
         int en_local = 0, rank_local = 0, bad = 0;
         u64 obs_local = 0ULL;
         for (u32 r = tid; r < n_chk; r += nt) {
-            const int aug = (int)((mat[(u64)r * wm + (k_cols >> 6)] >> (k_cols & 63)) & 1ULL);
+            const int aug = (int)((mat[(u64)r * wm + (k_list >> 6)] >> (k_list & 63)) & 1ULL);
             if (pivcol[r] < 0) {
                 bad |= aug;
                 enrow[r] = 0;
@@ -1058,11 +1096,44 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     __syncthreads();
     const int solvable = sh_i[0], en_piv = sh_i[1], rank = sh_i[2];
     const u64 obs_piv = sh_obs;
-    const u32 n_free = k_cols - (u32)rank;
+    const u32 n_nonpiv = k_list - (u32)rank;
+    const u32 n_free = P->full_columns ? (n_nonpiv < k_cols ? n_nonpiv : k_cols) : n_nonpiv;
+    int* gain = P_I32(s_gain) + (u64)blk * n_var;
+    if (P->full_columns && solvable) {
+        // exact energy change of every non-pivot column's nullspace vector at the forest solution
+        for (u32 b = tid; b <= QEC_BUCKETS; b += nt) sh_hist[b] = 0u;
+        __syncthreads();
+        for (u32 j = tid; j < k_list; j += nt) {
+            if (!pos[j]) continue;
+            const u32 w = j >> 6;
+            const u64 m = 1ULL << (j & 63);
+            int th = rec_en[j];
+            for (u32 r = 0; r < n_chk; ++r) {
+                if (mat[(u64)r * wm + w] & m) th += get_bit(epiv, r) ? -enrow[r] : enrow[r];
+            }
+            gain[j] = th;
+            int b = th + 512;
+            b = b < 0 ? 0 : (b > QEC_BUCKETS - 1 ? QEC_BUCKETS - 1 : b);
+            atomicAdd(&sh_hist[b + 1], 1u);
+        }
+        __syncthreads();
+    }
     if (tid == 0u) {
-        u32 nf = 0u;
-        for (u32 j = 0; j < k_cols; ++j) {
-            if (pos[j]) freep[nf++] = j;
+        if (!P->full_columns) {
+            u32 nf = 0u;
+            for (u32 j = 0; j < k_list; ++j) {
+                if (pos[j]) freep[nf++] = j;
+            }
+        } else if (solvable) {
+            // the n_free non-pivot columns of smallest gain, ties in reliability order
+            for (u32 b = 0; b < QEC_BUCKETS; ++b) sh_hist[b + 1] += sh_hist[b];
+            for (u32 j = 0; j < k_list; ++j) {
+                if (!pos[j]) continue;
+                int b = gain[j] + 512;
+                b = b < 0 ? 0 : (b > QEC_BUCKETS - 1 ? QEC_BUCKETS - 1 : b);
+                const u32 at = sh_hist[b]++;
+                if (at < n_free) freep[at] = j;
+            }
         }
         out->rank = rank;
         out->n_free = (int)n_free;

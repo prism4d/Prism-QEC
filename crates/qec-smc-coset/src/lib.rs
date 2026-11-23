@@ -13,5 +13,5 @@ pub use decoder::{
     auroc, escalation_flags, soft_margin, CosetDecoder, DecodeWork, DecoderConfig, EscalationConfig, ShotResult, SoftMargin,
     ESC_LATE, ESC_MARGIN, ESC_NONE, ESC_VALLEY,
 };
-pub use pivot::{build_pivot, Pivot, PivotScratch, Relax};
+pub use pivot::{build_pivot, build_pivot_full, Pivot, PivotScratch, Relax};
 pub use smc::{certify, exact_cosets, run_smc, run_walkers, Population, SmcConfig, SmcResult, SmcTables, Walker};

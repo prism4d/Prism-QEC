@@ -538,28 +538,57 @@ def cosmic_cluster(code, rng, target):
     return sorted(cluster)
 
 
-def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=500, onset_round=100,
-              hot_qubits=2, hot_mode="random"):
+# Drift protocol profile 2 (set on CALIB_2026 so that static BP-OSD has a usable error floor on
+# bb144_gross): crosstalk pairs and burst cluster scale with the number of data qubits.
+DRIFT2_XTBURST = {"xt_pairs_per_qubit": 1.0 / 18.0, "p_xt": 0.08, "burst_qubits_per_qubit": 1.0 / 6.0,
+                  "p_burst": 0.12, "tau": 25.0, "period": 96}
+
+
+# The drift profile every evaluation campaign uses.
+DRIFT_PROFILE = 2
+
+
+def drift_params(profile, experiment, n, p):
+    """Resolved generator parameters of a drift protocol profile.
+
+    profile 1: the first protocol draft (two hot qubits; three XX pairs at 0.06 plus one 20x
+               burst on n/9 qubits relaxing over 60 rounds).  Kept reproducible; its bb144 sets
+               give static BP-OSD almost nothing to fail on.
+    profile 2: round(n / 18) hot qubits; DRIFT2_XTBURST crosstalk with periodic bursts.
+    """
+    if experiment == "tls":
+        return {"hot_qubits": 2 if profile == 1 else int(round(n / 18)), "hot_mode": "random", "p_hot": 0.25}
+    if profile == 1:
+        return {"xt_pairs": 3, "p_xt": 0.06, "burst_qubits": max(6, n // 9), "p_burst": 20.0 * p * 2.0 / 3.0,
+                "tau": 60.0, "period": None}
+    d = DRIFT2_XTBURST
+    return {"xt_pairs": int(round(n * d["xt_pairs_per_qubit"])), "p_xt": d["p_xt"],
+            "burst_qubits": int(round(n * d["burst_qubits_per_qubit"])), "p_burst": d["p_burst"],
+            "tau": d["tau"], "period": d["period"]}
+
+
+def gen_drift(root, code_id, experiment, traces, domain, params=None, tag="", p=0.0015, total_rounds=500,
+              onset_round=100):
     """Non-stationary stream: every trace is `blocks` consecutive memory blocks whose noise
     changes at global round `onset_round` without telling any decoder (all receive the
     nominal DEM).
 
-      tls      N1: two random data qubits' idle fault channel jumps to X-flip probability 0.25
-               and stays there.
-      xtburst  N2: three schedule-conditioned crosstalk pairs activate (correlated XX with
-               probability 0.06 after CNOT step 3) and a cosmic-ray impact multiplies the idle
-               error of a compact cluster of n/9 data qubits by 20, relaxing with a 60-round
-               time constant (cut off after four time constants).
+      tls      N1: `hot_qubits` data qubits (uniformly random, or one compact cluster) get an
+               extra idle X-flip of probability `p_hot` per cycle and stay that way.
+      xtburst  N2: `xt_pairs` schedule-conditioned crosstalk pairs activate (correlated XX with
+               probability `p_xt` after CNOT step 3) and a compact cluster of `burst_qubits`
+               data qubits is hit by an idle X-flip burst of peak probability `p_burst` that
+               relaxes with time constant `tau` rounds: once (cut off after four time
+               constants) when `period` is None, otherwise again every `period` rounds.
 
-    `hot_qubits` / `hot_mode` only change the `tls` experiment: the number of dropped-out data
-    qubits, drawn uniformly ("random") or as one compact cluster around a Z check ("cluster").
-    The defaults are the protocol's N1; any other choice is a tagged development variant.
+    `params` defaults to protocol profile 1; `tag` names any other parameter set (it enters the
+    dataset name and the seed derivation, so every tagged set has fresh seeds).
     """
     code = get_code(code_id)
     n, n2, rounds = code["n"], code["n"] // 2, code["rounds"]
-    variant = "" if (hot_qubits, hot_mode) == (2, "random") or experiment != "tls" else f"_k{hot_qubits}{hot_mode}"
-    name = f"{code_id}_p{p:.4f}_drift_{experiment}{variant}"
-    regime = experiment + variant
+    prm = dict(params) if params else drift_params(1, experiment, n, p)
+    name = f"{code_id}_p{p:.4f}_drift{tag}_{experiment}"
+    regime = experiment if tag == "" else f"{experiment}/{tag}"
     out = Path(root) / "datasets" / name
     if (out / "meta.json").is_file():
         return name
@@ -582,32 +611,50 @@ def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=
     for tr in range(traces):
         rng = np.random.default_rng(derive_seed(domain, code_id, p, regime, "trace", tr))
         if experiment == "tls":
-            if hot_mode == "cluster":
-                hot_q = cosmic_cluster(code, rng, hot_qubits)
+            if prm["hot_mode"] == "cluster":
+                hot_q = cosmic_cluster(code, rng, prm["hot_qubits"])
             else:
-                hot_q = sorted(int(q) for q in rng.choice(n, size=hot_qubits, replace=False))
-            xt_idx, tau, p_hot, p_xt = [], None, 0.25, 0.0
+                hot_q = sorted(int(q) for q in rng.choice(n, size=prm["hot_qubits"], replace=False))
+            xt_idx, tau, period, p_hot, p_xt = [], None, None, prm["p_hot"], 0.0
         elif experiment == "xtburst":
-            hot_q = cosmic_cluster(code, rng, max(6, n // 9))
-            xt_idx = sorted(int(i) for i in rng.choice(len(pairs), size=3, replace=False))
-            tau, p_hot, p_xt = 60.0, 20.0 * p * 2.0 / 3.0, 0.06
+            hot_q = cosmic_cluster(code, rng, prm["burst_qubits"])
+            xt_idx = sorted(int(i) for i in rng.choice(len(pairs), size=prm["xt_pairs"], replace=False))
+            tau, period, p_hot, p_xt = prm["tau"], prm["period"], prm["p_burst"], prm["p_xt"]
         else:
             raise ValueError(experiment)
         truth.append({"trace": tr, "hot_data_qubits": hot_q, "xt_pairs": [list(pairs[i]) for i in xt_idx],
-                      "p_hot": p_hot, "p_xt": p_xt, "decay_tau_rounds": tau})
-        steady = None
-        for b in range(onset_block, blocks):
+                      "p_hot": p_hot, "p_xt": p_xt, "decay_tau_rounds": tau, "burst_period_rounds": period})
+
+        def block_noise(b):
             hot, act = {}, {}
             for r in range(rounds):
                 g = b * rounds + r
                 if g < onset_round:
                     continue
-                over = tau is not None and g - onset_round >= 4.0 * tau
-                scale = 1.0 if tau is None else (0.0 if over else float(np.exp(-(g - onset_round) / tau)))
+                scale = burst_scale(g - onset_round, tau, period)
                 if scale > 0.0:
                     hot[r] = {q: p_hot * scale for q in hot_q}
                 if xt_idx:
                     act[r] = {i: p_xt for i in xt_idx}
+            return hot, act
+
+        if period is not None:
+            # periodic bursts: blocks with the same per-round envelope share one circuit
+            groups = {}
+            for b in range(onset_block, blocks):
+                hot, act = block_noise(b)
+                key = tuple((r, round(next(iter(h.values())), 12)) for r, h in sorted(hot.items())) + (len(act),)
+                groups.setdefault(key, (hot, act, []))[2].append(b)
+            for hot, act, members in groups.values():
+                circ = template.assemble(hot, act)
+                s = circ.compile_detector_sampler(seed=derive_seed(domain, code_id, p, regime, "grp", tr, members[0]))
+                d1, o1 = s.sample(len(members), separate_observables=True)
+                for k, b in enumerate(members):
+                    dets[tr * blocks + b], obs[tr * blocks + b] = d1[k], o1[k]
+            continue
+        steady = None
+        for b in range(onset_block, blocks):
+            hot, act = block_noise(b)
             first_steady = onset_block + 1 if tau is None else (onset_round + int(4.0 * tau)) // rounds + 1
             if b >= first_steady:
                 if steady is None:
@@ -626,12 +673,21 @@ def gen_drift(root, code_id, experiment, traces, domain, p=0.0015, total_rounds=
     write_dataset(out, code, nominal, dets, obs, {
         "kind": "drift_" + experiment, "regime": experiment, "p": p, "seed_domain": domain,
         "stim_seed": derive_seed(domain, code_id, p, regime, "nominal"),
-        "hot_qubits": hot_qubits if experiment == "tls" else None, "hot_mode": hot_mode if experiment == "tls" else None,
+        "drift_tag": tag, "drift_params": prm,
         "traces": traces, "blocks_per_trace": blocks, "onset_round": onset_round, "onset_block": onset_block,
         "onset_round_in_block": onset_round % rounds, "total_rounds": blocks * rounds,
         "xt_candidate_pairs": [list(x) for x in pairs]})
     (out / "drift_truth.json").write_text(json.dumps(truth, indent=1) + "\n")
     return name
+
+
+def burst_scale(dt, tau, period):
+    """Burst envelope `dt >= 0` rounds after the onset (1 for a permanent change)."""
+    if tau is None:
+        return 1.0
+    if period is not None:
+        return float(np.exp(-(dt % period) / tau))
+    return 0.0 if dt >= 4.0 * tau else float(np.exp(-dt / tau))
 
 
 def dem_signatures(dem):
@@ -672,7 +728,7 @@ def run_genie(ds_dir):
     nominal = dem_signatures(template.assemble().detector_error_model(flatten_loops=True))
     truth = json.loads((ds / "drift_truth.json").read_text())
     onset_round, blocks = meta["onset_round"], meta["blocks_per_trace"]
-    tau = truth[0]["decay_tau_rounds"]
+    tau, period = truth[0]["decay_tau_rounds"], truth[0].get("burst_period_rounds")
     scale = []
     for b in range(blocks):
         acc = 0.0
@@ -680,7 +736,7 @@ def run_genie(ds_dir):
             g = b * rounds + r
             if g < onset_round:
                 continue
-            acc += 1.0 if tau is None else (0.0 if g - onset_round >= 4.0 * tau else float(np.exp(-(g - onset_round) / tau)))
+            acc += burst_scale(g - onset_round, tau, period)
         scale.append(acc / rounds)
     active = [sum(1 for r in range(rounds) if b * rounds + r >= onset_round) / rounds for b in range(blocks)]
     out_traces = []
@@ -878,7 +934,11 @@ def merge_baseline(ds, decoder, meta, out, jobs, workers, shots):
 
 def run_baselines(root, workers, max_seconds, only):
     deadline = time.time() + max_seconds
-    names = sorted(p.name for p in (Path(root) / "datasets").iterdir() if (p / "meta.json").is_file())
+    manifest = Path(root) / "oracle_manifest.json"
+    if manifest.is_file():
+        names = json.loads(manifest.read_text())["datasets"]  # superseded datasets are not decoded again
+    else:
+        names = sorted(p.name for p in (Path(root) / "datasets").iterdir() if (p / "meta.json").is_file())
     remaining = 0
     for decoder in ("bposd", "bplsd"):
         for name in names:
@@ -894,25 +954,45 @@ def run_baselines(root, workers, max_seconds, only):
 
 
 # ----------------------------------------------------------------------------- plans
-def write_manifest(root, domain):
+def write_manifest(root, domain, drift_tag=None):
+    """Lists the datasets of a root.  With `drift_tag`, only drift sets generated under that tag
+    stay in `datasets`; drift sets of any other parameter set are kept on disk and listed as
+    superseded (nothing is deleted)."""
     root = Path(root)
-    names = sorted(p.name for p in (root / "datasets").iterdir() if (p / "meta.json").is_file())
+    names, superseded = [], []
+    for d in sorted(p for p in (root / "datasets").iterdir() if (p / "meta.json").is_file()):
+        meta = json.loads((d / "meta.json").read_text())
+        stale = drift_tag is not None and meta["kind"] != "stationary" and meta.get("drift_tag", "") != drift_tag
+        (superseded if stale else names).append(d.name)
     manifest = {"schema": "prism.qec.sota.v1.oracle_manifest", "seed_domain": domain, "datasets": names,
+                "superseded_datasets": superseded, "drift_profile": DRIFT_PROFILE if drift_tag is not None else None,
                 "baseline_config": BASELINE_CFG, "stim_version": stim.__version__}
     (root / "oracle_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
 
 
-def run_calib(root, shots, drift_traces=None):
-    for code_id in ("bb72", "surface_d5"):
-        gen_stationary(root, code_id, 0.002, shots, DOMAIN_CALIB)
+def run_calib(root, shots, drift_traces=None, cells=None, drift_profile=1, drift_codes=("bb72",),
+              drift_experiments=("tls", "xtburst")):
+    """Calibration-domain datasets: stationary `cells` ("code:p"; default bb72 and surface_d5 at
+    p = 0.002) and, unless `drift_experiments` is empty, drift sets of the given profile."""
+    for cell in (cells if cells is not None else ["bb72:0.002", "surface_d5:0.002"]):
+        code_id, p = cell.split(":")
+        gen_stationary(root, code_id, float(p), shots, DOMAIN_CALIB)
     traces = drift_traces if drift_traces else max(8, shots // 2000)
-    gen_drift(root, "bb72", "tls", traces, DOMAIN_CALIB)
-    gen_drift(root, "bb72", "xtburst", traces, DOMAIN_CALIB)
+    for code_id in drift_codes:
+        for experiment in drift_experiments:
+            if drift_profile == 1:
+                gen_drift(root, code_id, experiment, traces, DOMAIN_CALIB)
+            else:
+                prm = drift_params(drift_profile, experiment, get_code(code_id)["n"], 0.0015)
+                gen_drift(root, code_id, experiment, traces, DOMAIN_CALIB, params=prm, tag=str(drift_profile))
     write_manifest(root, DOMAIN_CALIB)
 
 
 def run_campaign(root, shots, traces72, traces144, only, domain):
+    """Evaluation datasets: 6 codes x 4 noise points, and the drift experiments of the frozen
+    drift profile on bb72 and bb144_gross."""
     assert domain != DOMAIN_CALIB, "the calibration domain is generated by `calib`"
+    tag = str(DRIFT_PROFILE)
     for code_id in CODE_IDS:
         for p in NOISE_POINTS:
             if only and not any(tok in f"{code_id}_p{p:.4f}_stationary" for tok in only):
@@ -920,10 +1000,11 @@ def run_campaign(root, shots, traces72, traces144, only, domain):
             gen_stationary(root, code_id, p, shots, domain)
     for experiment in ("tls", "xtburst"):
         for code_id, traces in (("bb72", traces72), ("bb144_gross", traces144)):
-            if only and not any(tok in f"{code_id}_p0.0015_drift_{experiment}" for tok in only):
+            if traces <= 0 or (only and not any(tok in f"{code_id}_p0.0015_drift{tag}_{experiment}" for tok in only)):
                 continue
-            gen_drift(root, code_id, experiment, traces, domain)
-    write_manifest(root, domain)
+            prm = drift_params(DRIFT_PROFILE, experiment, get_code(code_id)["n"], 0.0015)
+            gen_drift(root, code_id, experiment, traces, domain, params=prm, tag=tag)
+    write_manifest(root, domain, drift_tag=tag)
 
 
 def selfcheck():
@@ -954,6 +1035,10 @@ def main():
     c.add_argument("--root", required=True)
     c.add_argument("--shots", type=int, default=20000)
     c.add_argument("--drift-traces", type=int, default=0, help="traces of the drift datasets (0: shots // 2000)")
+    c.add_argument("--cells", nargs="*", default=None, help="stationary cells as code:p (default bb72:0.002 surface_d5:0.002)")
+    c.add_argument("--drift-profile", type=int, default=1, choices=(1, 2))
+    c.add_argument("--drift-codes", nargs="*", default=["bb72"])
+    c.add_argument("--drift-experiments", nargs="*", default=["tls", "xtburst"])
     g = sub.add_parser("campaign")
     g.add_argument("--root", required=True)
     g.add_argument("--shots", type=int, default=100000)
@@ -980,13 +1065,21 @@ def main():
     dr.add_argument("--experiment", required=True, choices=("tls", "xtburst"))
     dr.add_argument("--traces", type=int, required=True)
     dr.add_argument("--domain", required=True, choices=(DOMAIN_CALIB, "SMOKE_2026"))
+    dr.add_argument("--tag", required=True, help="names the parameter set (dataset name and seeds)")
     dr.add_argument("--hot-qubits", type=int, default=2)
     dr.add_argument("--hot-mode", choices=("random", "cluster"), default="random")
+    dr.add_argument("--xt-pairs", type=int, default=3)
+    dr.add_argument("--p-xt", type=float, default=0.06)
+    dr.add_argument("--burst-qubits", type=int, default=16)
+    dr.add_argument("--p-burst", type=float, default=0.02)
+    dr.add_argument("--tau", type=float, default=60.0)
+    dr.add_argument("--period", type=int, default=0, help="burst period in rounds (0: a single burst)")
     args = ap.parse_args()
     if args.cmd == "selfcheck":
         selfcheck()
     elif args.cmd == "calib":
-        run_calib(args.root, args.shots, args.drift_traces)
+        run_calib(args.root, args.shots, args.drift_traces, args.cells, args.drift_profile, args.drift_codes,
+                  args.drift_experiments)
     elif args.cmd == "campaign":
         run_campaign(args.root, args.shots, args.traces72, args.traces144, args.only, args.domain)
     elif args.cmd == "baseline":
@@ -996,8 +1089,12 @@ def main():
     elif args.cmd == "genie":
         run_genie(args.dataset)
     elif args.cmd == "drift":
-        gen_drift(args.root, args.code, args.experiment, args.traces, args.domain,
-                  hot_qubits=args.hot_qubits, hot_mode=args.hot_mode)
+        if args.experiment == "tls":
+            prm = {"hot_qubits": args.hot_qubits, "hot_mode": args.hot_mode, "p_hot": 0.25}
+        else:
+            prm = {"xt_pairs": args.xt_pairs, "p_xt": args.p_xt, "burst_qubits": args.burst_qubits,
+                   "p_burst": args.p_burst, "tau": args.tau, "period": args.period or None}
+        gen_drift(args.root, args.code, args.experiment, args.traces, args.domain, params=prm, tag=args.tag)
         write_manifest(args.root, args.domain)
     return 0
 

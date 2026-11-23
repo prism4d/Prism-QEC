@@ -84,7 +84,8 @@ typedef struct QecParams {
     unsigned long long syn;         // u64[ring_shots * ws]  zero-copy DEVICEMAP syndrome ring
     unsigned long long out;         // QecShotOut[n_shots]
     unsigned long long rec_shot;    // u32[n_shots]   slow-path queue: shot of each record
-    unsigned long long rec_list;    // u32[n_shots * k_cols]  suspect list of each record
+    unsigned long long rec_list;    // u32[n_shots * k_cols]  suspect list of each record; full-column mode:
+                                    // u32[n_shots * n_var]   reliability bucket | Nishimori weight << 10
     unsigned long long rec_en;      // i32[n_shots * k_cols]  Nishimori weights of the suspects (as decoded)
     unsigned long long ctrl;        // u32[16] device control block (see QEC_CTRL_*)
     // ---- per-block slow-path scratch (smc_blocks blocks) -----------------------------------
@@ -102,6 +103,9 @@ typedef struct QecParams {
     unsigned long long s_theta;     // i32[smc_blocks * k_cols]
     unsigned long long s_cycobs;    // u64[smc_blocks * k_cols]
     unsigned long long s_zq;        // u64[smc_blocks * wz]
+    unsigned long long s_list;      // u32[smc_blocks * n_var]  full-column mode: faults in reliability order
+    unsigned long long s_len;       // i32[smc_blocks * n_var]  ... their Nishimori weights
+    unsigned long long s_gain;      // i32[smc_blocks * n_var]  ... exact gain of every non-pivot column
     unsigned long long w_rows;      // u64[smc_blocks * 2 * walkers * wr]
     unsigned long long w_z;         // u64[smc_blocks * 2 * walkers * wz]
     unsigned long long w_i32;       // i32[smc_blocks * 2 * walkers * 2]  energy, theta_sum
@@ -121,12 +125,13 @@ typedef struct QecParams {
     unsigned int n_checks, layers, n_pairs, n_cls;
     unsigned int streams, steps, n_shots, stream_major;
     unsigned int ws, wc, wr, wm, wz;
-    unsigned int k_cols, walkers, smc_blocks;
+    unsigned int k_cols, k_list, walkers, smc_blocks; // k_list: columns handed to the pivot (k_cols or n_var)
     // ---- frozen decoder parameters ---------------------------------------------------------
     int t_max, t_clean, alpha_q8, eta_q8, margin;
     int tau_margin, tau_gap, escalate, t_late, margin_gauge;
     int beta_steps, sweeps, quench_sweeps, resample_q8;
     int pair_lambda, pair_rounds; // reliability-ordered pair exploration of the pivot relaxation
+    int full_columns;             // 1: every fault enters the elimination, k_cols free coordinates by gain
     int tanh_max, twist_clip, metro_len, en_one;
     int neuro_on, n_min, g_threshold, g_threshold_hot, count_cap;
     int coincidence, coin_cap, coin_min, g_threshold_coin, coin_snap; // k-point coincidence estimator

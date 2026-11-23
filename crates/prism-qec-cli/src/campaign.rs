@@ -369,6 +369,7 @@ fn drift_dataset(
     let median_blocks = reaction.get(reaction.len() / 2).copied();
     let mut report = json!({
         "dataset": ds.name, "code_id": ds.code_id(), "shots": n, "traces": plan.streams, "blocks_per_trace": plan.steps,
+        "generator": ds.meta["drift_params"].clone(), "generator_tag": ds.meta["drift_tag"].clone(),
         "onset_block": onset, "post_onset_shots": post_n,
         "errors": {"prism_neuro_on": on_all, "prism_neuro_off": off_all, "bposd_static": osd_all, "bplsd_static": lsd_all},
         "post_onset_errors": {"prism_neuro_on": on_post, "prism_neuro_off": off_post, "bposd_static": osd_post, "bplsd_static": lsd_post},
@@ -598,8 +599,8 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             })
         })
         .collect();
-    let n1 = drift_experiment(&tls, "N1 TLS hot-qubit dropout: two data-qubit idle channels jump to X-flip probability 0.25 at round 100 of 500-round streams (p_base = 0.0015); no decoder is told");
-    let n2 = drift_experiment(&xtb, "N2 schedule-conditioned coupler crosstalk (three XX pairs at 0.06 after CNOT step 3) plus a 20x transient cosmic-ray burst on a compact n/9-qubit cluster (60-round relaxation) from round 100 (p_base = 0.0015)");
+    let n1 = drift_experiment(&tls, "N1 TLS hot-qubit dropout: the idle channel of randomly chosen data qubits gains an X-flip of probability 0.25 per cycle at round 100 of 500-round streams (p_base = 0.0015); no decoder is told. The number of hot qubits and every other generator parameter is listed per code under `generator`.");
+    let n2 = drift_experiment(&xtb, "N2 schedule-conditioned coupler crosstalk (correlated XX on data-qubit pairs after CNOT step 3) plus idle X-flip bursts on a compact cluster of data qubits, from round 100 of 500-round streams (p_base = 0.0015); no decoder is told. Pair count, probabilities, cluster size, relaxation time and burst period are listed per code under `generator`.");
     let receipt = json!({
         "schema": "prism.qec.sota.v1.frontier_receipt",
         "campaign": "bb144_sota_campaign",
@@ -610,14 +611,21 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             "config_id": frozen.config_id(), "config_sha256": frozen.sha256(),
             "canonical_text": frozen.canonical_text(),
             "calibration_seed_domain": qec_neuro_dem::SEED_DOMAIN_CALIB,
-            "calibration_datasets": if frozen.version <= 1 {
-                json!(["bb72 p=0.002", "surface_d5 p=0.002"])
-            } else {
-                json!(["bb72 p=0.002", "surface_d5 p=0.002", "bb72 p=0.0015 drift tls (400 traces)", "bb72 p=0.0015 drift xtburst (400 traces)"])
+            "calibration_datasets": match frozen.version {
+                0 | 1 => json!(["bb72 p=0.002", "surface_d5 p=0.002"]),
+                2 => json!(["bb72 p=0.002", "surface_d5 p=0.002", "bb72 p=0.0015 drift tls (400 traces)", "bb72 p=0.0015 drift xtburst (400 traces)"]),
+                _ => json!([
+                    "bb72 p=0.002", "surface_d5 p=0.002", "bb144_gross p=0.003", "hgp_hamming p=0.002",
+                    "bb72 and bb144_gross p=0.0015 drift tls / xtburst (drift profile 2, 400 traces each)"
+                ]),
             },
-            "development_cross_check_seed_domain": if frozen.version <= 1 { Value::Null } else { json!(qec_neuro_dem::SEED_DOMAIN_SMOKE) },
+            "development_cross_check_seed_domain": if frozen.version == 2 { json!(qec_neuro_dem::SEED_DOMAIN_SMOKE) } else { Value::Null },
             "eval_seed_domain": domain, "per_code_tuning": false,
-            "suspect_budget_rule": "k_cols = ceil(n_det * 256 / 256) rounded up to a multiple of 64, floor 128",
+            "suspect_budget_rule": if frozen.full_columns != 0 {
+                "every fault enters the reliability-ordered elimination; free coordinates = ceil(n_det * k_active_per_det_q8 / 256) rounded up to a multiple of 64, floor k_active_min, taken by smallest exact gain"
+            } else {
+                "k_cols = ceil(n_det * k_cols_per_det_q8 / 256) rounded up to a multiple of 64, floor k_cols_min"
+            },
         },
         "gpu_sm120_telemetry": {
             "device": info.device_name(), "compute_capability": format!("{}.{}", info.cc_major, info.cc_minor),
@@ -649,6 +657,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         "baselines": manifest["baseline_config"],
         "disclosures": [
             "Decoder design and early parameter exploration used development shots of bb72 and bb144_gross at p = 0.003 (dev seed, disjoint from both seed domains) before the protocol was adopted; FROZEN_V1 values were then set on CALIB_2026 only.",
+            "FROZEN_V3 = FROZEN_V2 plus the full-column pivot. It was developed after FROZEN_V2 lost to BP-OSD on bb144_gross development shots; its new values and every inherited value were validated on CALIB_2026 only (bb72, surface_d5, bb144_gross, hgp_hamming). The drift generator (profile 2) was re-scaled on CALIB_2026 so that static BP-OSD has a usable error floor on bb144_gross before any blind drift set was generated.",
             "FROZEN_V2 was developed after FROZEN_V1 had been measured on CALIB_2026 and SMOKE_2026 shots (bb72, bb144_gross, surface_d5, hgp_hamming); its values were chosen on CALIB_2026 and cross-checked on SMOKE_2026. No PRISM decode of a BLIND_HOLDOUT_2026 shot took place before the configuration was frozen; the CLI refuses blind datasets outside this campaign.",
             "The reported decision is the maximum-weight coset; errors of the forest, minimum-energy-walker and bitwise-marginal rules on the same shots are listed per cell.",
             "PRISM latency is GPU wall time; baseline latency is single-thread CPU time measured while other baseline workers were running.",

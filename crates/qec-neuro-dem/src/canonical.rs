@@ -1,10 +1,10 @@
 //! The immutable decoder configurations.
 //!
 //! Every dimensionless solver parameter lives in one frozen constant whose SHA-256 identity is
-//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V2`] is the active one;
-//! [`CanonicalDecoderConfig::FROZEN_V1`] is deprecated and stays reachable (same behaviour,
-//! same identity hash as when it was frozen).  Development may inspect only datasets of the
-//! `CALIB_2026` and `SMOKE_2026` seed domains; datasets of the `BLIND_HOLDOUT_2026` domain are
+//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V3`] is the active one;
+//! `FROZEN_V1` and `FROZEN_V2` are deprecated and stay reachable (same behaviour, same identity
+//! hash as when they were frozen).  Development may inspect only datasets of the `CALIB_2026`
+//! seed domain (`SMOKE_2026` shots only exercise the pipeline); datasets of the `BLIND_HOLDOUT_2026` domain are
 //! decoded with the active constant and nothing else: there is no per-code, per-distance or
 //! per-noise branch.  The one size that must follow the problem, the number of suspect
 //! columns handed to the pivot, is a fixed multiple of the detector count.
@@ -81,6 +81,12 @@ pub struct CanonicalDecoderConfig {
     pub coin_min: u32,
     pub g_threshold_coin: u32,
     pub snap: u32,
+    // ---- introduced by version 3 (part of the identity hash only when `version >= 3`)
+    /// Full-column pivot: every fault enters the elimination (V1/V2: the suspect prefix).
+    pub full_columns: u32,
+    /// Free coordinates kept by the full-column pivot per detector (Q8) and their floor.
+    pub k_active_per_det_q8: u32,
+    pub k_active_min: u32,
 }
 
 impl CanonicalDecoderConfig {
@@ -96,6 +102,9 @@ impl CanonicalDecoderConfig {
         coin_min: 2,
         g_threshold_coin: 24,
         snap: 0,
+        full_columns: 0,
+        k_active_per_det_q8: 32,
+        k_active_min: 64,
         t_max: 64,
         t_clean: 16,
         alpha_q8: 160,
@@ -157,15 +166,45 @@ impl CanonicalDecoderConfig {
         ..Self::FROZEN_V1
     };
 
-    /// The configuration every evaluation uses unless the deprecated one is requested.
-    pub const ACTIVE: Self = Self::FROZEN_V2;
+    /// Identity hash `FROZEN_V2` had when it was frozen.
+    pub const FROZEN_V2_SHA256: &'static str = "458f87d5d0e740eec75f65fd1ef472ae96b13d9da3236603a6e1b8e1de643f7b";
+
+    /// `FROZEN_V2` with the full-column pivot: every fault mechanism enters the
+    /// reliability-ordered elimination (exact OSD-0 warm start, always solvable) and the
+    /// free coordinates are the non-pivot nullspace vectors of smallest exact gain, relaxed
+    /// by single-column descent and pair moves over the 32 best columns.
+    ///
+    /// Frozen on `CALIB_2026` only (bb72, surface_d5 and hgp_hamming at p = 0.002,
+    /// bb144_gross at p = 0.003, drift profile 2 on bb72 and bb144_gross).  Measured there:
+    /// a larger free-coordinate budget (per-detector 64, floor 128 or 256) and a larger pair
+    /// budget (64 or 128 columns, 16 moves) change nothing beyond noise, so the smallest
+    /// budgets are kept; the escalation margin of 64 is confirmed against 32 on the same sets.
+    pub const FROZEN_V3: Self = Self {
+        version: 3,
+        full_columns: 1,
+        k_active_per_det_q8: 32,
+        k_active_min: 64,
+        pair_lambda: 32,
+        pair_rounds: 8,
+        ..Self::FROZEN_V2
+    };
+
+    /// The configuration every evaluation uses unless a deprecated one is requested.
+    pub const ACTIVE: Self = Self::FROZEN_V3;
 
     pub fn config_id(&self) -> &'static str {
-        if self.version <= 1 {
-            "FROZEN_V1"
-        } else {
-            "FROZEN_V2"
+        match self.version {
+            0 | 1 => "FROZEN_V1",
+            2 => "FROZEN_V2",
+            _ => "FROZEN_V3",
         }
+    }
+
+    /// Free coordinates of the full-column pivot: `ceil(n_det * k / 256)` rounded up to a
+    /// multiple of 64, floored at `k_active_min`.
+    pub fn k_active(&self, n_det: usize, n_err: usize) -> usize {
+        let raw = (n_det * self.k_active_per_det_q8 as usize).div_ceil(256).max(self.k_active_min as usize);
+        raw.div_ceil(64).saturating_mul(64).min(n_err)
     }
 
     /// Canonical serialisation: `key=value` lines in declaration order.  Version 1 serialises
@@ -226,6 +265,16 @@ impl CanonicalDecoderConfig {
                 out.push_str(&format!("{k}={v}\n"));
             }
         }
+        if self.version >= 3 {
+            let added: [(&str, i128); 3] = [
+                ("full_columns", self.full_columns as i128),
+                ("k_active_per_det_q8", self.k_active_per_det_q8 as i128),
+                ("k_active_min", self.k_active_min as i128),
+            ];
+            for (k, v) in added {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
         out
     }
 
@@ -279,7 +328,8 @@ impl CanonicalDecoderConfig {
                 wavefront: true,
             },
             smc: SmcConfig {
-                k_cols: self.k_cols(n_det, n_err),
+                k_cols: if self.full_columns != 0 { self.k_active(n_det, n_err) } else { self.k_cols(n_det, n_err) },
+                full_columns: self.full_columns != 0,
                 walkers: self.walkers as usize,
                 beta_steps: self.beta_steps,
                 sweeps: self.sweeps,
@@ -315,9 +365,22 @@ mod tests {
     fn identity_hash_is_stable_and_sensitive_to_every_field() {
         let base = CanonicalDecoderConfig::FROZEN_V1;
         assert_eq!(base.sha256(), CanonicalDecoderConfig::FROZEN_V1_SHA256);
-        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V2"));
+        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V3"));
         let v2 = CanonicalDecoderConfig::FROZEN_V2;
-        assert_ne!(v2.sha256(), base.sha256());
+        assert_eq!((v2.config_id(), v2.sha256().as_str()), ("FROZEN_V2", CanonicalDecoderConfig::FROZEN_V2_SHA256));
+        let v3 = CanonicalDecoderConfig::FROZEN_V3;
+        assert!(v3.sha256() != v2.sha256() && v3.sha256() != base.sha256());
+        for f in 0..3 {
+            let mut w = v3;
+            match f {
+                0 => w.full_columns ^= 1,
+                1 => w.k_active_per_det_q8 += 1,
+                _ => w.k_active_min += 1,
+            }
+            assert_ne!(w.sha256(), v3.sha256());
+        }
+        assert_eq!((v3.k_active(936, 8784), v3.k_active(252, 2232), v3.k_active(24, 40)), (128, 64, 40));
+        assert!(v3.decoder(936, 8784).smc.full_columns && !v2.decoder(936, 8784).smc.full_columns);
         for f in 0..10 {
             let mut w = v2;
             match f {

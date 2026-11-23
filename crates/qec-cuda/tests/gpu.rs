@@ -146,17 +146,20 @@ fn optional_and_deprecated_paths_keep_parity() {
         moved += (c.result.q_obs != plain[shot].result.q_obs || c.result.best_energy != plain[shot].result.best_energy) as usize;
     }
     eprintln!("[sm120] pair exploration changed {moved} of {} records", cpu.len());
-    let v1 = CanonicalDecoderConfig::FROZEN_V1.pipeline(b.dem.n_det, b.dem.n_err(), true);
-    let layout_v1 = NeuroLayout::build(&b.dem, &v1.neuro).unwrap();
-    let cpu = run_reference(&b.graph, &layout_v1, &shots, &plan, &v1);
-    let (records, tel) = gpu.decode(&b.graph, &layout_v1, &v1, &shots, &plan, LaunchMode::Batch).unwrap();
-    for (shot, (c, g)) in cpu.iter().zip(records.iter()).enumerate() {
-        if let Some(diff) = record_mismatch(c, g, 1e-6) {
-            panic!("FROZEN_V1, shot {shot}: {diff}");
+    for canon in [CanonicalDecoderConfig::FROZEN_V1, CanonicalDecoderConfig::FROZEN_V2] {
+        let id = canon.config_id();
+        let old = canon.pipeline(b.dem.n_det, b.dem.n_err(), true);
+        let layout = NeuroLayout::build(&b.dem, &old.neuro).unwrap();
+        let cpu = run_reference(&b.graph, &layout, &shots, &plan, &old);
+        let (records, tel) = gpu.decode(&b.graph, &layout, &old, &shots, &plan, LaunchMode::Batch).unwrap();
+        for (shot, (c, g)) in cpu.iter().zip(records.iter()).enumerate() {
+            if let Some(diff) = record_mismatch(c, g, 1e-6) {
+                panic!("{id}, shot {shot}: {diff}");
+            }
         }
+        assert!(cpu.iter().any(|r| r.report.modified_mechanisms > 0), "the {id} comparison must cover weight surgery");
+        assert_eq!(tel.host_syncs_in_decode_loop, 0);
     }
-    assert!(cpu.iter().any(|r| r.report.modified_mechanisms > 0), "the FROZEN_V1 comparison must cover weight surgery");
-    assert_eq!(tel.host_syncs_in_decode_loop, 0);
 }
 
 #[test]

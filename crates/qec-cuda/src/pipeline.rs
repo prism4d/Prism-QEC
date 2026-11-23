@@ -158,12 +158,14 @@ impl GpuDecoder {
         let (n_chk, n_var, n_shots) = (g.n_chk, g.n_var, plan.n_shots);
         let (streams, steps) = (plan.streams, plan.steps);
         let k_cols = dc.smc.k_cols.min(n_var);
+        let full = dc.smc.full_columns;
+        let k_list = if full { n_var } else { k_cols };
         let walkers = dc.smc.walkers;
         let smc_blocks = (self.smc_blocks as usize).min(n_shots.max(1)) as u32;
         let ws = dets.wps;
         let wc = layout.n_checks.div_ceil(64);
         let wr = n_chk.div_ceil(64);
-        let wm = (k_cols + 1).div_ceil(64);
+        let wm = (k_list + 1).div_ceil(64);
         let wz = k_cols.div_ceil(64).div_ceil(4) * 4;
         let metro = metropolis_thresholds(dc.smc.beta_steps);
         let mut p = QecParams { magic: QEC_PARAMS_MAGIC, ..QecParams::default() };
@@ -261,8 +263,8 @@ impl GpuDecoder {
         p.syn = rt.ring_dev();
         p.out = rt.alloc_zeroed(n_shots * std::mem::size_of::<QecShotOut>())?;
         p.rec_shot = rt.alloc(n_shots * 4)?;
-        p.rec_list = rt.alloc(n_shots * k_cols * 4)?;
-        p.rec_en = rt.alloc(n_shots * k_cols * 4)?;
+        p.rec_list = rt.alloc(n_shots * k_list * 4)?;
+        p.rec_en = rt.alloc(if full { 8 } else { n_shots * k_cols * 4 })?;
         p.ctrl = rt.alloc_zeroed(CTRL_WORDS * 4)?;
         // ---- per-block slow-path scratch
         let sb = smc_blocks as usize;
@@ -280,6 +282,10 @@ impl GpuDecoder {
         p.s_theta = rt.alloc(sb * k_cols * 4)?;
         p.s_cycobs = rt.alloc(sb * k_cols * 8)?;
         p.s_zq = rt.alloc(sb * wz * 8)?;
+        let full_scratch = if full { sb * n_var * 4 } else { 8 };
+        p.s_list = rt.alloc(full_scratch)?;
+        p.s_len = rt.alloc(full_scratch)?;
+        p.s_gain = rt.alloc(full_scratch)?;
         p.w_rows = rt.alloc(sb * 2 * walkers * wr * 8)?;
         p.w_z = rt.alloc(sb * 2 * walkers * wz * 8)?;
         p.w_i32 = rt.alloc(sb * 2 * walkers * 2 * 4)?;
@@ -314,6 +320,7 @@ impl GpuDecoder {
         p.wm = wm as u32;
         p.wz = wz as u32;
         p.k_cols = k_cols as u32;
+        p.k_list = k_list as u32;
         p.walkers = walkers as u32;
         p.smc_blocks = smc_blocks;
         p.t_max = dc.bp.t_max as i32;
@@ -331,6 +338,7 @@ impl GpuDecoder {
         p.quench_sweeps = dc.smc.quench_sweeps as i32;
         p.pair_lambda = dc.smc.pair_lambda as i32;
         p.pair_rounds = dc.smc.pair_rounds as i32;
+        p.full_columns = full as i32;
         p.resample_q8 = dc.smc.resample_q8 as i32;
         p.tanh_max = TANH_MAX;
         p.twist_clip = TWIST_CLIP;

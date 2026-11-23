@@ -18,8 +18,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "prism-qec", version, about = "PRISM-QEC: damped min-sum + Nishimori coset SMC decoder")]
 struct Cli {
-    /// Frozen configuration: `v2` (active) or the deprecated `v1`.
-    #[arg(long, global = true, value_enum, default_value_t = Frozen::V2)]
+    /// Frozen configuration: `v3` (active) or the deprecated `v1` / `v2`.
+    #[arg(long, global = true, value_enum, default_value_t = Frozen::V3)]
     frozen: Frozen,
     #[command(subcommand)]
     cmd: Cmd,
@@ -29,6 +29,7 @@ struct Cli {
 enum Frozen {
     V1,
     V2,
+    V3,
 }
 
 #[derive(Subcommand)]
@@ -170,6 +171,12 @@ pub struct Overrides {
     #[arg(long)]
     pub margin_gauge: Option<u32>,
     #[arg(long)]
+    pub full_columns: Option<u32>,
+    #[arg(long)]
+    pub k_active_per_det_q8: Option<u32>,
+    #[arg(long)]
+    pub k_active_min: Option<u32>,
+    #[arg(long)]
     pub coincidence: Option<u32>,
     #[arg(long)]
     pub coin_cap: Option<u32>,
@@ -221,7 +228,7 @@ impl Overrides {
         set!(
             t_max, t_clean, alpha_q8, eta_q8, eps_q12, disorder_q8, margin, tau_margin, tau_gap, cycle_weight, cell_cap,
             k_cols_per_det_q8, walkers, beta_steps, sweeps, quench_sweeps, resample_q8, t_late, pair_lambda, pair_rounds,
-            hle_mode, margin_gauge, coincidence, coin_cap, coin_min, g_threshold_coin, mc_blocks, hazard_inv, snap, g_threshold, g_threshold_hot, n_min, hot_on_milli, hot_off_milli
+            hle_mode, margin_gauge, full_columns, k_active_per_det_q8, k_active_min, coincidence, coin_cap, coin_min, g_threshold_coin, mc_blocks, hazard_inv, snap, g_threshold, g_threshold_hot, n_min, hot_on_milli, hot_off_milli
         );
         c
     }
@@ -282,6 +289,7 @@ fn main() -> Result<()> {
     let frozen = match cli.frozen {
         Frozen::V1 => CanonicalDecoderConfig::FROZEN_V1,
         Frozen::V2 => CanonicalDecoderConfig::FROZEN_V2,
+        Frozen::V3 => CanonicalDecoderConfig::FROZEN_V3,
     };
     match cli.cmd {
         Cmd::Config => {
