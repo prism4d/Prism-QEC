@@ -222,9 +222,31 @@ __device__ __forceinline__ i64 coincidence_g(u32 k, u32 n, u32 pi_q32, int lnpi_
     return 2 * ((i64)k * ((i64)logt[k] - (i64)logt[n] - (i64)lnpi_q16) - (((i64)k << 16) - mu_q16));
 }
 
+// writes the proposed prior LLR of mechanism `e` through the drift alarm and the deadband
+// (see stream.rs `commit_weight`)
+__device__ __forceinline__ void commit_weight(const QecParams* P, int* llr, int* en, int nom, u32 e, int value, int armed,
+                                              int& writes, int& modified)
+{
+    int val = armed ? value : nom;
+    const int old = llr[e];
+    if (P->llr_deadband > 0) {
+        const int dv = val - old;
+        if (nom - val < P->llr_deadband) {
+            val = nom;
+        } else if (old != nom && (dv < 0 ? -dv : dv) < P->llr_deadband) {
+            val = old;
+        }
+    }
+    writes += val != old;
+    llr[e] = val;
+    en[e] = energy_from_llr(val, P->en_one);
+    modified += val != nom;
+}
+
 extern "C" __global__ void qec_neuro_update(const QecParams* P)
 {
-    __shared__ int sh_cnt[2];
+    __shared__ int sh_cnt[4]; // modified mechanisms, hot checks, weight writes, armed
+    __shared__ int sh_arm;
     const u32 tid = threadIdx.x, nt = blockDim.x, s = blockIdx.x;
     if (!P->neuro_on) return;
     u32* ctrl = (u32*)P->ctrl;
@@ -232,6 +254,40 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
     if (shot >= P->n_shots) return;
     const u32 nc = P->n_checks, wc = P->wc, np = P->n_pairs, nv = P->n_var;
     const u64* syn = P_U64(syn) + (u64)shot * P->ws;
+    // ---- drift alarm on the block syndrome weight: one-sided CUSUM against the nominal circuit
+    if (tid == 0u) {
+        sh_cnt[2] = 0;
+        sh_cnt[3] = 1;
+        sh_arm = 0;
+    }
+    __syncthreads();
+    if (P->arm_h_q8 > 0) {
+        int wsum = 0;
+        for (u32 w = tid; w < P->ws; w += nt) wsum += (int)__popcll(syn[w]);
+        atomicAdd(&sh_arm, wsum);
+        __syncthreads();
+        if (tid == 0u) {
+            i64* st = (i64*)P->arm_state + (u64)s * 2;
+            const i64 thr = ((i64)P->arm_h_q8 * P->blk_sigma_q8) >> 8;
+            const i64 inc = ((i64)sh_arm << 8) - P->blk_mu_q8 - (((i64)P->arm_kappa_q8 * P->blk_sigma_q8) >> 8);
+            i64 c = st[0] + inc;
+            c = c < 0 ? 0 : (c > 4 * thr ? 4 * thr : c);
+            i64 armed = st[1] & 1, calm = st[1] >> 8;
+            if (c >= thr) {
+                armed = 1;
+                calm = 0;
+            } else if (c == 0) {
+                calm += 1;
+                if (calm >= (i64)(P->arm_calm > 1 ? P->arm_calm : 1)) armed = 0;
+            } else {
+                calm = 0;
+            }
+            st[0] = c;
+            st[1] = armed | (calm << 8);
+            sh_cnt[3] = (int)armed;
+        }
+        __syncthreads();
+    }
     const u32* det_of = P_U32(det_of);
     const double* exposure = (const double*)P->exposure;
     double* bo_r = (double*)P->bo_r + (u64)s * nc * QEC_R_MAX;
@@ -414,8 +470,9 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
     const u32* sup = P_U32(cls_sup);
     int* llr = P_I32(llr) + (u64)s * nv;
     int* en = P_I32(en) + (u64)s * nv;
+    const int armed = sh_cnt[3];
     for (int phase = 0; phase < 2; ++phase) {
-        int modified = 0;
+        int modified = 0, writes = 0;
         for (u32 e = tid; e < nv; e += nt) {
             const u32 lo = mp_ptr[e], hi = mp_ptr[e + 1];
             const int big = msize[e] >= 3;
@@ -431,9 +488,7 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
                     value = cand < value ? cand : value;
                     for (u32 q = lo; q < hi; ++q) atomicMax(&explained[mp[q]], p);
                 }
-                llr[e] = value;
-                en[e] = energy_from_llr(value, P->en_one);
-                modified += value != llr_nom[e];
+                commit_weight(P, llr, en, llr_nom[e], e, value, armed, writes, modified);
                 continue;
             }
             int p = QEC_INT_MAX, veto = 0;
@@ -454,11 +509,10 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
                     for (u32 q = lo; q < hi; ++q) atomicMax(&explained[mp[q]], p);
                 }
             }
-            llr[e] = value;
-            en[e] = energy_from_llr(value, P->en_one);
-            modified += value != llr_nom[e];
+            commit_weight(P, llr, en, llr_nom[e], e, value, armed, writes, modified);
         }
         atomicAdd(&sh_cnt[0], modified);
+        atomicAdd(&sh_cnt[2], writes);
         __syncthreads();
     }
     int hot_local = 0;
@@ -469,6 +523,8 @@ extern "C" __global__ void qec_neuro_update(const QecParams* P)
         QecShotOut* out = (QecShotOut*)P->out + shot;
         out->modified_mechanisms = sh_cnt[0];
         out->hot_checks = sh_cnt[1];
+        out->weight_writes = sh_cnt[2];
+        out->armed = sh_cnt[3];
     }
 }
 
@@ -710,7 +766,12 @@ extern "C" __global__ void qec_bp_decode(const QecParams* P)
         if (!P->neuro_on) {
             out->modified_mechanisms = 0;
             out->hot_checks = 0;
+            out->weight_writes = 0;
+            out->armed = 0;
         }
+        out->piv_span = 0;
+        out->amb_gap = QEC_INT_MAX;
+        out->smc_sampled = 0;
         out->esc_margin = esc_margin;
         out->esc_gap = esc_gap;
         out->bp_converged = (unsigned char)converged;
@@ -940,6 +1001,7 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
     __shared__ int sh_i[8];
     __shared__ u64 sh_obs;
     __shared__ long long sh_pair;
+    __shared__ unsigned long long sh_or[2];
     __shared__ u32 sh_hist[QEC_BUCKETS + 1];
     const u32 tid = threadIdx.x, nt = blockDim.x, blk = blockIdx.x;
     u32* ctrl = (u32*)P->ctrl;
@@ -1021,22 +1083,47 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
         sh_piv[0] = QEC_INT_MAX;
         sh_piv[1] = QEC_INT_MAX;
         sh_i[5] = 0; // pivots found so far
+        sh_i[6] = 0; // columns visited: position after the last pivot
+        sh_or[0] = 0ULL;
+        sh_or[1] = 0ULL;
     }
     __syncthreads();
-    // ---- Gauss-Jordan in reliability order, lowest unused row as pivot
-    for (u32 j = 0; j < k_list; ++j) {
-        if (sh_i[5] == (int)n_chk) break; // every row has its pivot
-        const u32 w = j >> 6;
-        const u64 m = 1ULL << (j & 63);
-        for (u32 r = tid; r < n_chk; r += nt) {
-            if (pivcol[r] < 0 && (mat[(u64)r * wm + w] & m)) {
-                atomicMin(&sh_piv[j & 1u], (int)r);
-                break;
+    // ---- Gauss-Jordan in reliability order, lowest unused row as pivot.  The next pivot column
+    // is the first column with a 1 in an unused row; the OR of one 64-column word over the unused
+    // rows marks those columns, so dependent columns are skipped a word at a time.  The loop ends
+    // when the rank of d1 is reached.  Pivots are identical to the column-by-column reference.
+    // The OR accumulates in two alternating slots: the slot read in one pass is cleared during
+    // the next one, when no thread reads it.
+    {
+        u32 j0 = 0u, slot = 0u;
+        const u32 n_words = (k_list + 63u) >> 6;
+        while ((j0 >> 6) < n_words && sh_i[5] < (int)P->h_rank) {
+            const u32 w = j0 >> 6;
+            u64 acc_or = 0ULL;
+            for (u32 r = tid; r < n_chk; r += nt) {
+                if (pivcol[r] < 0) acc_or |= mat[(u64)r * wm + w];
             }
-        }
-        __syncthreads();
-        const int pr = sh_piv[j & 1u];
-        if (pr != QEC_INT_MAX) {
+            if (acc_or) atomicOr(&sh_or[slot], acc_or);
+            __syncthreads();
+            u64 mask = sh_or[slot] & (~0ULL << (j0 & 63u));
+            if (w == (k_list >> 6)) mask &= (1ULL << (k_list & 63u)) - 1ULL;
+            if (tid == 0u) sh_or[slot ^ 1u] = 0ULL;
+            slot ^= 1u;
+            if (mask == 0ULL) {
+                j0 = (w + 1u) << 6;
+                __syncthreads();
+                continue;
+            }
+            const u32 j = (w << 6) + (u32)(__ffsll((long long)mask) - 1);
+            const u64 m = 1ULL << (j & 63u);
+            for (u32 r = tid; r < n_chk; r += nt) {
+                if (pivcol[r] < 0 && (mat[(u64)r * wm + w] & m)) {
+                    atomicMin(&sh_piv[0], (int)r);
+                    break;
+                }
+            }
+            __syncthreads();
+            const int pr = sh_piv[0];
             const u64* prow = mat + (u64)pr * wm;
             for (u32 r = tid; r < n_chk; r += nt) {
                 u64* row = mat + (u64)r * wm;
@@ -1044,15 +1131,15 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
                     for (u32 q = 0; q < wm; ++q) row[q] ^= prow[q];
                 }
             }
-        }
-        if (tid == 0u) {
-            if (pr != QEC_INT_MAX) {
+            if (tid == 0u) {
                 pivcol[pr] = (int)j;
                 sh_i[5] += 1;
+                sh_i[6] = (int)(j + 1u);
+                sh_piv[0] = QEC_INT_MAX;
             }
-            sh_piv[(j + 1u) & 1u] = QEC_INT_MAX;
+            __syncthreads();
+            j0 = j + 1u;
         }
-        __syncthreads();
     }
     // ---- consistency, forest solution, weight bit-planes
     for (u32 q = tid; q < QEC_EN_BITS * wr; q += nt) planes[q] = 0ULL;
@@ -1251,16 +1338,44 @@ extern "C" __global__ void qec_smc_decode(const QecParams* P)
         out->piv_obs = obs_piv;
         out->piv_energy = en_piv;
         out->q_obs = wobs;
+        sh_i[7] = QEC_INT_MAX; // ambiguity gap
     }
     __syncthreads();
-    // ---- twist field at the quenched state
+    // ---- twist field at the quenched state; the smallest value over the coordinates whose
+    // cycle changes the logical class is the ambiguity gap of the relaxed solution
     if (active_walker) {
+        int amb = QEC_INT_MAX;
         for (u32 t = tid; t < n_free; t += nw) {
             int th = delta_energy(V, t, rows, get_bit(z, t));
-            theta[t] = th < -P->twist_clip ? -P->twist_clip : (th > P->twist_clip ? P->twist_clip : th);
+            th = th < -P->twist_clip ? -P->twist_clip : (th > P->twist_clip ? P->twist_clip : th);
+            theta[t] = th;
+            if (cycobs[t] != 0ULL && th < amb) amb = th;
         }
+        if (amb != QEC_INT_MAX) atomicMin(&sh_i[7], amb);
     }
     __syncthreads();
+    {
+        // two-stage slow path: no logical-changing coordinate within tau_ambig of the relaxed
+        // solution -> commit it without sampling
+        const int amb_gap = sh_i[7];
+        const int skip = P->tau_ambig > 0 && amb_gap >= P->tau_ambig;
+        if (tid == 0u) {
+            out->piv_span = sh_i[6];
+            out->amb_gap = amb_gap;
+            out->smc_sampled = (unsigned char)!skip;
+            if (skip) {
+                out->obs = wobs;
+                out->best_obs = wobs;
+                out->mode_obs = wobs;
+                out->marginal_obs = wobs;
+                out->best_energy = energy;
+                out->energy_gap = amb_gap;
+                out->min_abs_df = QEC_DF_CAP;
+                out->ess = (double)nw;
+            }
+        }
+        if (skip) return;
+    }
     // ---- exact draw from the twisted reference
     if (active_walker) {
         for (u32 t = 0; t < n_free; ++t) {

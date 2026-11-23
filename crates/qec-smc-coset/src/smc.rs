@@ -37,6 +37,9 @@ pub struct SmcConfig {
     /// Full-column pivot: every fault enters the elimination and `k_cols` is the number of
     /// free coordinates kept (smallest exact gain first) instead of the suspect prefix.
     pub full_columns: bool,
+    /// Two-stage slow path: when the relaxed solution's ambiguity gap (see `Pivot::amb_gap`)
+    /// is at least this many SMC energy units, it is committed without sampling (0: always sample).
+    pub tau_ambig: i32,
     /// Resample when `ESS < W * resample_q8 / 256` (0 = never: plain annealed importance sampling).
     pub resample_q8: u32,
     /// HLE threshold on the herald risk (see `ShotResult::hle_risk`).
@@ -57,6 +60,7 @@ impl Default for SmcConfig {
             pair_lambda: 0,
             pair_rounds: 0,
             full_columns: false,
+            tau_ambig: 0,
             resample_q8: 128,
             tau_cert: 1.0,
             khat_max: 0.7,

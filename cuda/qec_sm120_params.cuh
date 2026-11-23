@@ -70,6 +70,7 @@ typedef struct QecParams {
     unsigned long long explained;   // i32[streams * n_pairs]
     unsigned long long cls_cnt;     // u8[streams * n_cls * 2]: matches, exposure
     unsigned long long cls_rate;    // i32[streams * n_cls]
+    unsigned long long arm_state;   // i64[streams * 2]: drift-alarm CUSUM (Q8), armed | calm blocks << 8
     unsigned long long llr;         // i32[streams * n_var]   live prior LLRs (the L2-pinned DEM)
     unsigned long long en;          // i32[streams * n_var]   live Nishimori weights
     // ---- per-stream fast-path state --------------------------------------------------------
@@ -115,6 +116,8 @@ typedef struct QecParams {
     unsigned long long w_wt;        // u64[smc_blocks * walkers]
     unsigned long long w_lw;        // f64[smc_blocks * (2 * walkers + 128)]  log-weights + PSIS scratch
     unsigned long long seed_smc;
+    long long blk_mu_q8;            // nominal detection events per block: mean and sigma (Q8)
+    long long blk_sigma_q8;
     double hazard;
     double hot_on;
     double hot_off;
@@ -126,15 +129,18 @@ typedef struct QecParams {
     unsigned int streams, steps, n_shots, stream_major;
     unsigned int ws, wc, wr, wm, wz;
     unsigned int k_cols, k_list, walkers, smc_blocks; // k_list: columns handed to the pivot (k_cols or n_var)
+    unsigned int h_rank;                              // rank of d1: the elimination stops there
     // ---- frozen decoder parameters ---------------------------------------------------------
     int t_max, t_clean, alpha_q8, eta_q8, margin;
     int tau_margin, tau_gap, escalate, t_late, margin_gauge;
     int beta_steps, sweeps, quench_sweeps, resample_q8;
     int pair_lambda, pair_rounds; // reliability-ordered pair exploration of the pivot relaxation
     int full_columns;             // 1: every fault enters the elimination, k_cols free coordinates by gain
+    int tau_ambig;                // two-stage slow path: commit without sampling above this ambiguity gap (0: off)
     int tanh_max, twist_clip, metro_len, en_one;
     int neuro_on, n_min, g_threshold, g_threshold_hot, count_cap;
     int coincidence, coin_cap, coin_min, g_threshold_coin, coin_snap; // k-point coincidence estimator
+    int arm_h_q8, arm_kappa_q8, arm_calm, llr_deadband;                // drift alarm and weight-register deadband
     int f2_engine; // 0: __popcll(a & b) & 1, 1: .b1 and.popc tensor-core path
     int steps_per_launch; // fast-loop time steps per graph launch (0: all of them)
 } QecParams;
@@ -177,12 +183,17 @@ typedef struct QecShotOut {
     int hot_checks;
     int esc_margin;                  // soft margins of a converged fast path (INT_MAX: none)
     int esc_gap;
+    int weight_writes;               // weight registers written in this block
+    int armed;                       // 1 iff the drift alarm held the registers armed
+    int piv_span;                    // columns visited by the elimination
+    int amb_gap;                     // ambiguity gap of the relaxed solution (INT_MAX: none)
     unsigned char bp_converged;
     unsigned char esc_reason;
     unsigned char smc_ran;
     unsigned char solvable;
     unsigned char hle;
-    unsigned char pad[3];
+    unsigned char smc_sampled;       // 0 iff the relaxed solution was committed without sampling
+    unsigned char pad[2];
 } QecShotOut;
 
 #endif

@@ -35,7 +35,8 @@ import scipy.sparse as sp
 import stim
 
 DOMAIN_CALIB = "CALIB_2026"
-DOMAIN_BLIND = "BLIND_HOLDOUT_2026"
+DOMAIN_BLIND = "BLIND_HOLDOUT_2026"        # decoded under FROZEN_V4: spent, kept reproducible
+DOMAIN_BLIND_V5 = "BLIND_HOLDOUT_V5_2026"  # pre-registered for FROZEN_V5: fresh seeds, never used for development
 NOISE_POINTS = (0.001, 0.002, 0.003, 0.004)
 SX_SCHEDULE = ["idle", 1, 4, 3, 5, 0, 2]
 SZ_SCHEDULE = [3, 5, 0, 1, 2, 4, "idle"]
@@ -1008,8 +1009,8 @@ def run_campaign(root, shots, traces72, traces144, only, domain):
 
 
 def selfcheck():
-    assert derive_seed(DOMAIN_CALIB, "bb72", 0.002, "stationary", "sample") != \
-        derive_seed(DOMAIN_BLIND, "bb72", 0.002, "stationary", "sample")
+    seeds = {derive_seed(dom, "bb72", 0.002, "stationary", "sample") for dom in (DOMAIN_CALIB, DOMAIN_BLIND, DOMAIN_BLIND_V5)}
+    assert len(seeds) == 3, "seed domains must give distinct seeds"
     for code_id in CODE_IDS:
         code = get_code(code_id)
         circ = build_circuit(code, 0.001)
@@ -1045,8 +1046,9 @@ def main():
     g.add_argument("--traces72", type=int, default=400)
     g.add_argument("--traces144", type=int, default=400)
     g.add_argument("--only", nargs="*", default=[])
-    g.add_argument("--domain", default=DOMAIN_BLIND,
-                   help="seed domain; anything but the default is a pipeline smoke run on unrelated seeds")
+    g.add_argument("--domain", default=DOMAIN_BLIND_V5,
+                   help="seed domain: the pre-registered blind domain of the active configuration by default; "
+                        "BLIND_HOLDOUT_2026 reproduces the spent FROZEN_V4 holdout; anything else is a smoke run")
     b = sub.add_parser("baseline")
     b.add_argument("--dataset", required=True)
     b.add_argument("--decoder", choices=("bposd", "bplsd"), required=True)

@@ -146,7 +146,12 @@ fn optional_and_deprecated_paths_keep_parity() {
         moved += (c.result.q_obs != plain[shot].result.q_obs || c.result.best_energy != plain[shot].result.best_energy) as usize;
     }
     eprintln!("[sm120] pair exploration changed {moved} of {} records", cpu.len());
-    for canon in [CanonicalDecoderConfig::FROZEN_V1, CanonicalDecoderConfig::FROZEN_V2, CanonicalDecoderConfig::FROZEN_V3] {
+    for canon in [
+        CanonicalDecoderConfig::FROZEN_V1,
+        CanonicalDecoderConfig::FROZEN_V2,
+        CanonicalDecoderConfig::FROZEN_V3,
+        CanonicalDecoderConfig::FROZEN_V4,
+    ] {
         let id = canon.config_id();
         let old = canon.pipeline(b.dem.n_det, b.dem.n_err(), true);
         let layout = NeuroLayout::build(&b.dem, &old.neuro).unwrap();

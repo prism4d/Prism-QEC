@@ -12,7 +12,9 @@ pub mod stream;
 pub mod tide;
 
 pub use bocpd::{Bocpd, R_MAX};
-pub use canonical::{CanonicalDecoderConfig, SEED_DOMAIN_BLIND, SEED_DOMAIN_CALIB, SEED_DOMAIN_SMOKE};
+pub use canonical::{
+    is_blind_domain, CanonicalDecoderConfig, SEED_DOMAIN_BLIND, SEED_DOMAIN_BLIND_V5, SEED_DOMAIN_CALIB, SEED_DOMAIN_SMOKE,
+};
 pub use pipeline::{
     run_reference, run_reference_oracle, run_reference_with_weights, PipelineConfig, ShotRecord, StreamPlan,
 };

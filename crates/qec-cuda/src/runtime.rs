@@ -98,7 +98,7 @@ extern "C" {
 }
 
 /// Offsets of probe fields as the Rust mirror sees them, in the shim's probe order.
-fn rust_param_offsets() -> [usize; 11] {
+fn rust_param_offsets() -> [usize; 16] {
     use std::mem::offset_of;
     [
         offset_of!(QecParams, magic),
@@ -112,10 +112,15 @@ fn rust_param_offsets() -> [usize; 11] {
         offset_of!(QecParams, k_cols),
         offset_of!(QecParams, t_max),
         offset_of!(QecParams, steps_per_launch),
+        offset_of!(QecParams, arm_state),
+        offset_of!(QecParams, blk_sigma_q8),
+        offset_of!(QecParams, h_rank),
+        offset_of!(QecParams, tau_ambig),
+        offset_of!(QecParams, llr_deadband),
     ]
 }
 
-fn rust_out_offsets() -> [usize; 5] {
+fn rust_out_offsets() -> [usize; 7] {
     use std::mem::offset_of;
     [
         offset_of!(QecShotOut, khat),
@@ -123,6 +128,8 @@ fn rust_out_offsets() -> [usize; 5] {
         offset_of!(QecShotOut, hot_checks),
         offset_of!(QecShotOut, bp_converged),
         offset_of!(QecShotOut, hle),
+        offset_of!(QecShotOut, amb_gap),
+        offset_of!(QecShotOut, smc_sampled),
     ]
 }
 

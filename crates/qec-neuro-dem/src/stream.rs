@@ -74,6 +74,18 @@ pub struct NeuroConfig {
     /// Erasure snap: a class whose checks are all HOT and whose regime is younger than
     /// `n_min` samples is a known erasure (`w = 0`) as soon as it is active.
     pub snap: bool,
+    /// Deadband of the weight registers in BP units: proposals within it of the nominal weight
+    /// leave the nominal weight, and changes between two modified values smaller than it are
+    /// not written (0: every proposal is written).
+    pub llr_deadband: i32,
+    /// Drift alarm that arms the weight registers: a one-sided CUSUM of the block syndrome
+    /// weight against the nominal circuit, `c <- max(0, c + S - mu - kappa sigma)`, armed when
+    /// `c >= h sigma` and disarmed after `arm_calm` consecutive blocks with `c = 0`.  While
+    /// disarmed every register holds its nominal weight (the estimators keep running, so the
+    /// evidence is in place the moment the alarm fires).  `arm_h_q8 = 0`: always armed.
+    pub arm_h_q8: u32,
+    pub arm_kappa_q8: u32,
+    pub arm_calm: u32,
 }
 
 impl Default for NeuroConfig {
@@ -94,6 +106,10 @@ impl Default for NeuroConfig {
             coin_min: 2,
             g_threshold_coin: 24,
             snap: false,
+            llr_deadband: 0,
+            arm_h_q8: 0,
+            arm_kappa_q8: 128,
+            arm_calm: 4,
         }
     }
 }
@@ -145,6 +161,10 @@ pub struct NeuroLayout {
     pub cls_sup: Vec<u32>,
     /// mechanism -> class, or [`NO_CLASS`].
     pub mech_cls: Vec<u32>,
+    /// Mean and standard deviation (Q8) of the number of detection events per block under
+    /// the nominal circuit.
+    pub blk_mu_q8: i64,
+    pub blk_sigma_q8: i64,
 }
 
 /// Marks a mechanism that belongs to no class.
@@ -168,6 +188,12 @@ impl NeuroLayout {
         ensure!(cfg.count_cap >= 16 && cfg.count_cap <= 255, "count_cap must be in [16, 255]");
         ensure!(cfg.coin_cap >= 8 && cfg.coin_cap <= 255, "coin_cap must be in [8, 255]");
         ensure!(cfg.coin_min >= 1, "coin_min must be at least 1");
+        ensure!(
+            cfg.arm_h_q8 == 0 || cfg.mc_blocks >= 256,
+            "the drift alarm needs a nominal reference of at least 256 blocks (mc_blocks = {})",
+            cfg.mc_blocks
+        );
+        ensure!(cfg.llr_deadband >= 0, "llr_deadband must not be negative");
         let mut site = Vec::with_capacity(dem.n_det);
         for (d, c) in dem.det_coords.iter().enumerate() {
             ensure!(!c[0].is_nan() && !c[1].is_nan(), "detector {d} has no (check, layer) coordinates");
@@ -296,8 +322,12 @@ impl NeuroLayout {
         // interventional reference: the same statistics under the nominal circuit
         let mut nominal = vec![[0u64; 8]; pairs.len()];
         let mut cls_nominal = vec![[0u64; 2]; patterns.len()];
+        let (mut w_sum, mut w_sq) = (0u64, 0u64);
         for blk in 0..cfg.mc_blocks as u64 {
             let (dets, _) = dem.sample(&dem.probs, cfg.seed, blk);
+            let w: u64 = dets.iter().map(|x| x.count_ones() as u64).sum();
+            w_sum += w;
+            w_sq += w * w;
             let has = |c: u16, l: usize| det_of[l * n_checks + c as usize] != NO_DETECTOR;
             let bit = |c: u16, l: usize| {
                 let d = det_of[l * n_checks + c as usize] as usize;
@@ -325,6 +355,11 @@ impl NeuroLayout {
         }
         // nominal coincidence rate; a pattern never seen in the reference gets half a count
         let cls_pi: Vec<f64> = cls_nominal.iter().map(|c| (c[0] as f64).max(0.5) / (c[1] as f64).max(1.0)).collect();
+        let blocks = (cfg.mc_blocks as f64).max(1.0);
+        let w_mean = w_sum as f64 / blocks;
+        let w_var = (w_sq as f64 / blocks - w_mean * w_mean).max(0.0);
+        let blk_mu_q8 = (w_mean * 256.0).round() as i64;
+        let blk_sigma_q8 = ((w_var.sqrt() * 256.0).round() as i64).max(1);
         let cls_pi_q32: Vec<u32> = cls_pi.iter().map(|&p| (p * 4294967296.0).round().clamp(1.0, 4294967295.0) as u32).collect();
         let cls_lnpi_q16: Vec<i32> = cls_pi.iter().map(|&p| (p.ln() * 65536.0).round() as i32).collect();
         let mut pair_nom_te_q16 = Vec::with_capacity(pairs.len());
@@ -392,6 +427,8 @@ impl NeuroLayout {
             cls_sup_ptr,
             cls_sup,
             mech_cls,
+            blk_mu_q8,
+            blk_sigma_q8,
         })
     }
 
@@ -461,6 +498,28 @@ pub struct BlockReport {
     pub modified_mechanisms: u32,
     /// Mechanisms currently treated as known erasures (`w = 0`).
     pub erased_mechanisms: u32,
+    /// Weight registers whose value changed in this block.
+    pub weight_writes: u32,
+    /// 1 iff the drift alarm held the registers armed in this block.
+    pub armed: u32,
+}
+
+/// Writes the proposed prior LLR of mechanism `e` through the deadband and updates the report.
+fn commit_weight(llr: &mut [i32], en: &mut [i32], nom: i32, deadband: i32, e: usize, proposed: i32, report: &mut BlockReport) {
+    let old = llr[e];
+    let mut val = proposed;
+    if deadband > 0 {
+        if nom - val < deadband {
+            val = nom;
+        } else if old != nom && (val - old).abs() < deadband {
+            val = old;
+        }
+    }
+    report.weight_writes += (val != old) as u32;
+    llr[e] = val;
+    en[e] = energy_from_llr(val);
+    report.modified_mechanisms += (val != nom) as u32;
+    report.erased_mechanisms += (val <= 0) as u32;
 }
 
 /// Online state of one stream.
@@ -485,6 +544,10 @@ pub struct StreamState {
     /// `[matches, exposure]` of every mechanism class and its active rate (Q12, 0: inactive).
     pub cls_cnt: Vec<[u8; 2]>,
     cls_rate: Vec<i32>,
+    /// Drift alarm: CUSUM value (Q8), armed flag, consecutive blocks at zero.
+    cusum_q8: i64,
+    armed: bool,
+    calm_run: u32,
 }
 
 /// Marks a (check, layer) site without a detector.
@@ -515,6 +578,9 @@ impl StreamState {
             explained: vec![0; layout.pairs.len()],
             cls_cnt: vec![[0u8; 2]; layout.n_cls()],
             cls_rate: vec![0; layout.n_cls()],
+            cusum_q8: 0,
+            armed: false,
+            calm_run: 0,
         }
     }
 
@@ -538,6 +604,28 @@ impl StreamState {
         let wc = nc.div_ceil(64);
         let mut report = BlockReport::default();
         let mut cur = vec![0u64; wc];
+        // ---- drift alarm on the block syndrome weight
+        let armed = if cfg.arm_h_q8 == 0 {
+            true
+        } else {
+            let s: i64 = dets.iter().map(|w| w.count_ones() as i64).sum();
+            let thr = (cfg.arm_h_q8 as i64 * layout.blk_sigma_q8) >> 8;
+            let inc = (s << 8) - layout.blk_mu_q8 - ((cfg.arm_kappa_q8 as i64 * layout.blk_sigma_q8) >> 8);
+            self.cusum_q8 = (self.cusum_q8 + inc).clamp(0, 4 * thr);
+            if self.cusum_q8 >= thr {
+                self.armed = true;
+                self.calm_run = 0;
+            } else if self.cusum_q8 == 0 {
+                self.calm_run += 1;
+                if self.calm_run >= cfg.arm_calm.max(1) {
+                    self.armed = false;
+                }
+            } else {
+                self.calm_run = 0;
+            }
+            self.armed
+        };
+        report.armed = armed as u32;
         for l in 0..layout.layers {
             // ---- phase 1: changepoint filters; a transition records the MAP run length
             cur.iter_mut().for_each(|w| *w = 0);
@@ -713,10 +801,8 @@ impl StreamState {
                             *slot = (*slot).max(p);
                         }
                     }
-                    self.llr[e] = llr;
-                    self.en[e] = energy_from_llr(llr);
-                    report.modified_mechanisms += (llr != layout.llr_nom[e]) as u32;
-                    report.erased_mechanisms += (llr <= 0) as u32;
+                    let llr = if armed { llr } else { layout.llr_nom[e] };
+                    commit_weight(&mut self.llr, &mut self.en, layout.llr_nom[e], cfg.llr_deadband, e, llr, &mut report);
                     continue;
                 }
                 let (mut p, mut veto) = (i32::MAX, false);
@@ -738,10 +824,8 @@ impl StreamState {
                         }
                     }
                 }
-                self.llr[e] = llr;
-                self.en[e] = energy_from_llr(llr);
-                report.modified_mechanisms += (llr != layout.llr_nom[e]) as u32;
-                report.erased_mechanisms += (llr <= 0) as u32;
+                let llr = if armed { llr } else { layout.llr_nom[e] };
+                commit_weight(&mut self.llr, &mut self.en, layout.llr_nom[e], cfg.llr_deadband, e, llr, &mut report);
             }
         }
         report
@@ -876,6 +960,129 @@ mod tests {
             }
         }
         assert!(touched * 50 <= blocks, "false surgery in {touched}/{blocks} stationary blocks");
+    }
+
+    /// The `FROZEN_V5` commit policy on top of the coincidence monitor: drift alarm, calm
+    /// blocks to disarm and register deadband exactly as frozen.
+    fn alarm_cfg() -> NeuroConfig {
+        let v5 = crate::canonical::CanonicalDecoderConfig::FROZEN_V5;
+        NeuroConfig {
+            arm_h_q8: v5.arm_h_q8,
+            arm_kappa_q8: v5.arm_kappa_q8,
+            arm_calm: v5.arm_calm,
+            llr_deadband: v5.llr_deadband as i32,
+            ..coincidence_cfg()
+        }
+    }
+
+    /// Behind the drift alarm a stationary stream leaves the weight registers alone: every
+    /// disarmed block ends at the nominal model, and the estimators run exactly as without it.
+    #[test]
+    fn drift_alarm_holds_the_registers_on_a_stationary_stream() {
+        let b = bench_with(alarm_cfg());
+        let open = NeuroConfig { arm_h_q8: 0, llr_deadband: 0, ..b.cfg };
+        let (mut armed, mut written, mut open_written, mut blocks) = (0u32, 0u32, 0u32, 0u32);
+        for stream in 0..8u64 {
+            let (mut st, mut reference) = (StreamState::new(&b.layout), StreamState::new(&b.layout));
+            for blk in 0..150u64 {
+                let (dets, _) = b.dem.sample(&b.dem.probs, 700 + stream, blk);
+                let rep = st.ingest_block(&b.layout, &b.cfg, &dets);
+                let rep_open = reference.ingest_block(&b.layout, &open, &dets);
+                assert_eq!(rep.hot_checks, rep_open.hot_checks, "the alarm must not touch the estimators");
+                assert_eq!(rep_open.armed, 1);
+                if rep.armed == 0 {
+                    assert!(st.llr == b.layout.llr_nom && rep.modified_mechanisms == 0, "disarmed block {blk} left a modified weight");
+                }
+                armed += rep.armed;
+                written += (rep.weight_writes > 0) as u32;
+                open_written += (rep_open.weight_writes > 0) as u32;
+                blocks += 1;
+            }
+        }
+        eprintln!("[alarm stationary] blocks {blocks}: armed {armed}, with register writes {written} (without the alarm {open_written})");
+        assert!(open_written >= 20, "the ungated monitor must churn on this stream ({open_written})");
+        assert!(armed * 200 <= blocks, "false alarms in {armed}/{blocks} stationary blocks (limit 0.5%)");
+        assert_eq!(written, 0, "register writes on a stationary stream");
+    }
+
+    /// The alarm arms within two blocks of a syndrome-weight excursion, stays armed while it
+    /// lasts, and restores the nominal registers after the stream has been calm again.
+    #[test]
+    fn drift_alarm_arms_on_excess_syndrome_weight_and_disarms_when_calm() {
+        let b = bench_with(alarm_cfg());
+        let mut noisy = b.dem.probs.clone();
+        for p in noisy.iter_mut() {
+            *p = (*p * 3.0).min(0.5);
+        }
+        let mut st = StreamState::new(&b.layout);
+        for blk in 0..40u64 {
+            let (dets, _) = b.dem.sample(&b.dem.probs, 4242, blk);
+            assert_eq!(st.ingest_block(&b.layout, &b.cfg, &dets).armed, 0, "armed in calm block {blk}");
+        }
+        let mut armed_at = None;
+        let mut trace = Vec::new();
+        for blk in 40..60u64 {
+            let (dets, _) = b.dem.sample(&noisy, 4242, blk);
+            let rep = st.ingest_block(&b.layout, &b.cfg, &dets);
+            trace.push((dets.iter().map(|w| w.count_ones()).sum::<u32>(), st.cusum_q8 >> 8));
+            if rep.armed == 1 && armed_at.is_none() {
+                armed_at = Some(blk - 40);
+            }
+            assert!(armed_at.is_none() || rep.armed == 1, "the alarm dropped during the excursion (block {blk})");
+        }
+        // tripled fault rates add about twice the nominal mean per block; the statistic then
+        // needs threshold / (2 mu - slack) blocks, and twice that is allowed here
+        let l = &b.layout;
+        let slack = (b.cfg.arm_kappa_q8 as i64 * l.blk_sigma_q8) >> 8;
+        let expect = ((b.cfg.arm_h_q8 as i64 * l.blk_sigma_q8) >> 8) / (2 * l.blk_mu_q8 - slack) + 1;
+        eprintln!("[alarm] excursion (block weight, statistic): {:?}", &trace[..8]);
+        assert!(armed_at.is_some_and(|d| d as i64 <= 2 * expect), "alarm delay {armed_at:?} blocks, expected about {expect}");
+        let mut disarmed_at = None;
+        for blk in 60..400u64 {
+            let (dets, _) = b.dem.sample(&b.dem.probs, 4242, blk);
+            if st.ingest_block(&b.layout, &b.cfg, &dets).armed == 0 {
+                disarmed_at = Some(blk - 60);
+                break;
+            }
+        }
+        // the statistic is clamped at four thresholds, so the release time is bounded
+        eprintln!(
+            "[alarm] nominal block weight {:.2} +- {:.2}; armed after {armed_at:?} blocks (expected about {expect}), released {disarmed_at:?} blocks after the excursion",
+            l.blk_mu_q8 as f64 / 256.0,
+            l.blk_sigma_q8 as f64 / 256.0
+        );
+        assert!(disarmed_at.is_some(), "the alarm never released");
+        assert!(st.llr == b.layout.llr_nom, "the registers must return to the nominal model");
+    }
+
+    /// Register deadband: proposals within the band of the nominal value are the nominal
+    /// value, a held value moves only by at least the band, and only real changes are writes.
+    #[test]
+    fn deadband_snaps_to_nominal_and_ignores_small_moves() {
+        let nom = 400;
+        let (mut llr, mut en) = (vec![nom], vec![energy_from_llr(nom)]);
+        let mut rep = BlockReport::default();
+        let mut step = |deadband: i32, proposed: i32, rep: &mut BlockReport| {
+            commit_weight(&mut llr, &mut en, nom, deadband, 0, proposed, rep);
+            assert_eq!(en[0], energy_from_llr(llr[0]));
+            llr[0]
+        };
+        assert_eq!((step(16, nom - 15, &mut rep), rep.weight_writes, rep.modified_mechanisms), (nom, 0, 0));
+        assert_eq!((step(16, nom - 100, &mut rep), rep.weight_writes, rep.modified_mechanisms), (nom - 100, 1, 1));
+        assert_eq!((step(16, nom - 110, &mut rep), rep.weight_writes), (nom - 100, 1));
+        assert_eq!((step(16, nom - 85, &mut rep), rep.weight_writes), (nom - 100, 1));
+        assert_eq!((step(16, nom - 116, &mut rep), rep.weight_writes), (nom - 116, 2));
+        assert_eq!((step(16, nom - 3, &mut rep), rep.weight_writes), (nom, 3));
+        assert_eq!((step(16, -40, &mut rep), rep.weight_writes, rep.erased_mechanisms), (-40, 4, 1));
+        // without a band every change is written
+        assert_eq!((step(0, -39, &mut rep), rep.weight_writes), (-39, 5));
+        assert_eq!((step(0, -39, &mut rep), rep.weight_writes), (-39, 5));
+    }
+
+    /// The burst of the next test is survived behind the drift alarm and the deadband too.
+    #[test]
+    fn dropout_burst_is_survived_behind_the_drift_alarm() {
+        dropout_burst(&bench_with(alarm_cfg()), "coincidence+alarm", 128);
     }
 
     /// Mid-run dropout burst: from global round 500 on, the six data qubits of one check are

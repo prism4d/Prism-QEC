@@ -12,14 +12,14 @@ use anyhow::{ensure, Result};
 use clap::{Args, Parser, Subcommand};
 use cpu::Decision;
 use dataset::{Dataset, DecodeModel};
-use qec_neuro_dem::{CanonicalDecoderConfig, PipelineConfig, SEED_DOMAIN_BLIND, SEED_DOMAIN_CALIB, SEED_DOMAIN_SMOKE};
+use qec_neuro_dem::{is_blind_domain, CanonicalDecoderConfig, PipelineConfig, SEED_DOMAIN_CALIB, SEED_DOMAIN_SMOKE};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "prism-qec", version, about = "PRISM-QEC: damped min-sum + Nishimori coset SMC decoder")]
 struct Cli {
-    /// Frozen configuration: `v4` (active) or the deprecated `v1` / `v2` / `v3`.
-    #[arg(long, global = true, value_enum, default_value_t = Frozen::V4)]
+    /// Frozen configuration: `v5` (active) or the deprecated `v1` to `v4`.
+    #[arg(long, global = true, value_enum, default_value_t = Frozen::V5)]
     frozen: Frozen,
     #[command(subcommand)]
     cmd: Cmd,
@@ -31,6 +31,7 @@ enum Frozen {
     V2,
     V3,
     V4,
+    V5,
 }
 
 #[derive(Subcommand)]
@@ -182,6 +183,16 @@ pub struct Overrides {
     #[arg(long)]
     pub margin_gauge: Option<u32>,
     #[arg(long)]
+    pub arm_h_q8: Option<u32>,
+    #[arg(long)]
+    pub arm_kappa_q8: Option<u32>,
+    #[arg(long)]
+    pub arm_calm: Option<u32>,
+    #[arg(long)]
+    pub llr_deadband: Option<u32>,
+    #[arg(long)]
+    pub tau_ambig: Option<u32>,
+    #[arg(long)]
     pub full_columns: Option<u32>,
     #[arg(long)]
     pub k_active_per_det_q8: Option<u32>,
@@ -243,7 +254,7 @@ impl Overrides {
         set!(
             t_max, t_clean, alpha_q8, eta_q8, eps_q12, disorder_q8, margin, tau_margin, tau_gap, cycle_weight, cell_cap,
             k_cols_per_det_q8, walkers, beta_steps, sweeps, quench_sweeps, resample_q8, t_late, pair_lambda, pair_rounds,
-            hle_mode, margin_gauge, full_columns, k_active_per_det_q8, k_active_min, coincidence, coin_cap, coin_min, g_threshold_coin, mc_blocks, hazard_inv, snap, g_threshold, g_threshold_hot, n_min, hot_on_milli, hot_off_milli
+            hle_mode, margin_gauge, arm_h_q8, arm_kappa_q8, arm_calm, llr_deadband, tau_ambig, full_columns, k_active_per_det_q8, k_active_min, coincidence, coin_cap, coin_min, g_threshold_coin, mc_blocks, hazard_inv, snap, g_threshold, g_threshold_hot, n_min, hot_on_milli, hot_off_milli
         );
         c
     }
@@ -292,9 +303,10 @@ fn run_and_report(
 /// Blind-holdout shots are quarantined: only `campaign --release-blind` may decode them.
 fn ensure_not_blind(ds: &Dataset) -> Result<()> {
     ensure!(
-        ds.seed_domain() != SEED_DOMAIN_BLIND,
-        "'{}' is a {SEED_DOMAIN_BLIND} dataset: it may only be decoded by `campaign --release-blind`",
-        ds.name
+        !is_blind_domain(ds.seed_domain()),
+        "'{}' is a {} dataset: it may only be decoded by `campaign --release-blind`",
+        ds.name,
+        ds.seed_domain()
     );
     Ok(())
 }
@@ -306,6 +318,7 @@ fn main() -> Result<()> {
         Frozen::V2 => CanonicalDecoderConfig::FROZEN_V2,
         Frozen::V3 => CanonicalDecoderConfig::FROZEN_V3,
         Frozen::V4 => CanonicalDecoderConfig::FROZEN_V4,
+        Frozen::V5 => CanonicalDecoderConfig::FROZEN_V5,
     };
     match cli.cmd {
         Cmd::Config => {

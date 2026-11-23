@@ -25,6 +25,9 @@ pub struct TannerGraph {
     /// logical observable mask per variable.
     pub obs: Vec<u64>,
     pub n_obs: usize,
+    /// Rank of `d1` over GF(2): once an elimination has this many pivots, every remaining
+    /// column is a non-pivot column.
+    pub h_rank: usize,
 }
 
 impl TannerGraph {
@@ -57,6 +60,7 @@ impl TannerGraph {
             n_chk,
             n_var,
             n_edge,
+            h_rank: cx.d1.to_dense().rank(),
             n_cell: cx.n2(),
             chk_ptr,
             chk_var,

@@ -73,6 +73,11 @@ size_t qec_params_offsetof(int which)
     case 8: return offsetof(QecParams, k_cols);
     case 9: return offsetof(QecParams, t_max);
     case 10: return offsetof(QecParams, steps_per_launch);
+    case 11: return offsetof(QecParams, arm_state);
+    case 12: return offsetof(QecParams, blk_sigma_q8);
+    case 13: return offsetof(QecParams, h_rank);
+    case 14: return offsetof(QecParams, tau_ambig);
+    case 15: return offsetof(QecParams, llr_deadband);
     default: return (size_t)-1;
     }
 }
@@ -84,6 +89,8 @@ size_t qec_shot_out_offsetof(int which)
     case 2: return offsetof(QecShotOut, hot_checks);
     case 3: return offsetof(QecShotOut, bp_converged);
     case 4: return offsetof(QecShotOut, hle);
+    case 5: return offsetof(QecShotOut, amb_gap);
+    case 6: return offsetof(QecShotOut, smc_sampled);
     default: return (size_t)-1;
     }
 }

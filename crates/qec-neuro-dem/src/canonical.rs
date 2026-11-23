@@ -1,8 +1,8 @@
 //! The immutable decoder configurations.
 //!
 //! Every dimensionless solver parameter lives in one frozen constant whose SHA-256 identity is
-//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V4`] is the active one;
-//! `FROZEN_V1`, `FROZEN_V2` and `FROZEN_V3` are deprecated and stay reachable (same behaviour, same identity
+//! recorded in every receipt.  [`CanonicalDecoderConfig::FROZEN_V5`] is the active one;
+//! `FROZEN_V1` to `FROZEN_V4` are deprecated and stay reachable (same behaviour, same identity
 //! hash as when they were frozen).  Development may inspect only datasets of the `CALIB_2026`
 //! seed domain (`SMOKE_2026` shots only exercise the pipeline); datasets of the `BLIND_HOLDOUT_2026` domain are
 //! decoded with the active constant and nothing else: there is no per-code, per-distance or
@@ -19,6 +19,14 @@ use sha2::{Digest, Sha256};
 pub const SEED_DOMAIN_CALIB: &str = "CALIB_2026";
 pub const SEED_DOMAIN_BLIND: &str = "BLIND_HOLDOUT_2026";
 pub const SEED_DOMAIN_SMOKE: &str = "SMOKE_2026";
+/// Pre-registered blind domain of `FROZEN_V5`.  `BLIND_HOLDOUT_2026` was decoded under
+/// `FROZEN_V4` and is spent: no later configuration may be evaluated on it.
+pub const SEED_DOMAIN_BLIND_V5: &str = "BLIND_HOLDOUT_V5_2026";
+
+/// True for every blind-holdout seed domain, spent or not.
+pub fn is_blind_domain(domain: &str) -> bool {
+    domain.starts_with("BLIND_HOLDOUT")
+}
 
 /// All fields are integers so the canonical serialisation, and therefore the hash, is exact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +95,16 @@ pub struct CanonicalDecoderConfig {
     /// Free coordinates kept by the full-column pivot per detector (Q8) and their floor.
     pub k_active_per_det_q8: u32,
     pub k_active_min: u32,
+    // ---- introduced by version 5 (part of the identity hash only when `version >= 5`)
+    /// Weight-register deadband (BP units).
+    pub llr_deadband: u32,
+    /// Drift alarm arming the weight registers: CUSUM threshold and slack in sigma (Q8),
+    /// calm blocks before disarming.  `arm_h_q8 = 0`: always armed.
+    pub arm_h_q8: u32,
+    pub arm_kappa_q8: u32,
+    pub arm_calm: u32,
+    /// Two-stage slow path: ambiguity gap (SMC energy units) above which sampling is skipped.
+    pub tau_ambig: u32,
 }
 
 impl CanonicalDecoderConfig {
@@ -105,6 +123,11 @@ impl CanonicalDecoderConfig {
         full_columns: 0,
         k_active_per_det_q8: 32,
         k_active_min: 64,
+        llr_deadband: 0,
+        arm_h_q8: 0,
+        arm_kappa_q8: 128,
+        arm_calm: 4,
+        tau_ambig: 0,
         t_max: 64,
         t_clean: 16,
         alpha_q8: 160,
@@ -204,15 +227,58 @@ impl CanonicalDecoderConfig {
     /// exact weights, so the remaining gap is locating the burst qubits, not timing.
     pub const FROZEN_V4: Self = Self { version: 4, hle_mode: 2, ..Self::FROZEN_V3 };
 
+    /// Identity hash `FROZEN_V4` had when it was frozen and sealed.
+    pub const FROZEN_V4_SHA256: &'static str = "3cccb2525a9d9230c9f6fc0c53dff648c023692546f3a42349aa745c618cec41";
+
+    /// `FROZEN_V4` plus three changes, set on `CALIB_2026` only:
+    ///
+    /// * drift alarm: the weight registers hold their nominal values until a one-sided CUSUM
+    ///   of the block syndrome weight (slack 1 sigma) reaches 5 sigma, and return to them
+    ///   after 4 calm blocks.  Blocks with a register write before a drift onset fall from
+    ///   10-18% to none of the 19,200 pre-onset blocks of the four calibration drift sets.
+    ///   The price is about one block of alarm delay: 1,244 failures over those sets against
+    ///   1,222 with a 0.5 sigma slack (which leaves 0.2-0.3% of the stationary blocks written);
+    /// * weight-register deadband of 0.25 nat (2 to 7 times fewer register writes after onset);
+    /// * two-stage slow path: the relaxed solution is committed without sampling unless a
+    ///   logical-changing coordinate lies within 3 nats of it.  On the calibration sets the
+    ///   sampler is skipped for 95-100% of slow-path shots with the same failure counts.
+    ///
+    /// Measured and not adopted: a boundary-weight / soft-mass / competing-column escalation
+    /// gate.  Every fast-path false convergence on the bb72 calibration sets is a shot on
+    /// which BP-OSD returns the same wrong class, and removing them all with that gate costs
+    /// 29 points of fast-path share at p = 0.001.
+    pub const FROZEN_V5: Self = Self {
+        version: 5,
+        arm_h_q8: 1280,
+        arm_kappa_q8: 256,
+        arm_calm: 4,
+        llr_deadband: 16,
+        tau_ambig: 48,
+        ..Self::FROZEN_V4
+    };
+
+    /// Identity hash of `FROZEN_V5`, pinned before its blind domain is generated.
+    pub const FROZEN_V5_SHA256: &'static str = "9708a5dc78fb70ec786b3374ecca3ceda340409e979b39299076eefd59a8c1ef";
+
     /// The configuration every evaluation uses unless a deprecated one is requested.
-    pub const ACTIVE: Self = Self::FROZEN_V4;
+    pub const ACTIVE: Self = Self::FROZEN_V5;
+
+    /// The blind seed domain this configuration may be evaluated on.
+    pub fn blind_domain(&self) -> &'static str {
+        if self.version <= 4 {
+            SEED_DOMAIN_BLIND
+        } else {
+            SEED_DOMAIN_BLIND_V5
+        }
+    }
 
     pub fn config_id(&self) -> &'static str {
         match self.version {
             0 | 1 => "FROZEN_V1",
             2 => "FROZEN_V2",
             3 => "FROZEN_V3",
-            _ => "FROZEN_V4",
+            4 => "FROZEN_V4",
+            _ => "FROZEN_V5",
         }
     }
 
@@ -291,6 +357,18 @@ impl CanonicalDecoderConfig {
                 out.push_str(&format!("{k}={v}\n"));
             }
         }
+        if self.version >= 5 {
+            let added: [(&str, i128); 5] = [
+                ("arm_h_q8", self.arm_h_q8 as i128),
+                ("arm_kappa_q8", self.arm_kappa_q8 as i128),
+                ("arm_calm", self.arm_calm as i128),
+                ("llr_deadband", self.llr_deadband as i128),
+                ("tau_ambig", self.tau_ambig as i128),
+            ];
+            for (k, v) in added {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
         out
     }
 
@@ -327,6 +405,10 @@ impl CanonicalDecoderConfig {
             coin_min: self.coin_min,
             g_threshold_coin: self.g_threshold_coin,
             snap: self.snap != 0,
+            llr_deadband: self.llr_deadband as i32,
+            arm_h_q8: self.arm_h_q8,
+            arm_kappa_q8: self.arm_kappa_q8,
+            arm_calm: self.arm_calm,
         }
     }
 
@@ -346,6 +428,7 @@ impl CanonicalDecoderConfig {
             smc: SmcConfig {
                 k_cols: if self.full_columns != 0 { self.k_active(n_det, n_err) } else { self.k_cols(n_det, n_err) },
                 full_columns: self.full_columns != 0,
+                tau_ambig: self.tau_ambig as i32,
                 walkers: self.walkers as usize,
                 beta_steps: self.beta_steps,
                 sweeps: self.sweeps,
@@ -381,7 +464,24 @@ mod tests {
     fn identity_hash_is_stable_and_sensitive_to_every_field() {
         let base = CanonicalDecoderConfig::FROZEN_V1;
         assert_eq!(base.sha256(), CanonicalDecoderConfig::FROZEN_V1_SHA256);
-        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V4"));
+        assert_eq!((base.config_id(), CanonicalDecoderConfig::ACTIVE.config_id()), ("FROZEN_V1", "FROZEN_V5"));
+        assert_eq!(CanonicalDecoderConfig::FROZEN_V4.sha256(), CanonicalDecoderConfig::FROZEN_V4_SHA256);
+        let v5 = CanonicalDecoderConfig::FROZEN_V5;
+        assert_eq!(v5.sha256(), CanonicalDecoderConfig::FROZEN_V5_SHA256);
+        for f in 0..5 {
+            let mut w = v5;
+            match f {
+                0 => w.arm_h_q8 += 1,
+                1 => w.arm_kappa_q8 += 1,
+                2 => w.arm_calm += 1,
+                3 => w.llr_deadband += 1,
+                _ => w.tau_ambig += 1,
+            }
+            assert_ne!(w.sha256(), v5.sha256());
+        }
+        // the spent blind domain belongs to FROZEN_V4 and earlier; FROZEN_V5 has its own
+        assert_eq!((CanonicalDecoderConfig::FROZEN_V4.blind_domain(), v5.blind_domain()), (SEED_DOMAIN_BLIND, SEED_DOMAIN_BLIND_V5));
+        assert!(is_blind_domain(SEED_DOMAIN_BLIND) && is_blind_domain(SEED_DOMAIN_BLIND_V5) && !is_blind_domain(SEED_DOMAIN_CALIB));
         let v4 = CanonicalDecoderConfig::FROZEN_V4;
         assert_eq!(CanonicalDecoderConfig::FROZEN_V3.sha256(), CanonicalDecoderConfig::FROZEN_V3_SHA256);
         assert_ne!(v4.sha256(), CanonicalDecoderConfig::FROZEN_V3_SHA256);

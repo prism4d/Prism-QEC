@@ -16,7 +16,7 @@
 //! columns are independent).  Non-converged shots use the beliefs of the unperturbed prefix.
 
 use crate::pivot::{build_pivot, build_pivot_full, PivotScratch};
-use crate::smc::{run_smc, SmcConfig, SmcTables};
+use crate::smc::{run_smc, SmcConfig, SmcTables, DELTA_F_CAP};
 use qec_hodge_bp::{BpConfig, BpWork, HodgeBp, TannerGraph};
 
 /// Escalation reasons (bit flags in [`ShotResult::esc_reason`]).
@@ -84,6 +84,11 @@ pub struct ShotResult {
     /// Soft margins of a converged fast path ([`ESC_NONE`] when not converged or empty).
     pub esc_margin: i32,
     pub esc_gap: i32,
+    /// Slow path: columns visited by the elimination and the ambiguity gap of the relaxed
+    /// solution; `smc_sampled` is false when that solution was committed without sampling.
+    pub piv_span: u32,
+    pub amb_gap: i32,
+    pub smc_sampled: bool,
     /// True iff the slow path ran (non-converged or escalated).
     pub smc_ran: bool,
     /// False iff the syndrome is outside the span of the suspect columns.
@@ -259,6 +264,7 @@ impl<'g> CosetDecoder<'g> {
             min_abs_df: f64::INFINITY,
             esc_margin: ESC_NONE,
             esc_gap: ESC_NONE,
+            amb_gap: ESC_NONE,
             ..ShotResult::default()
         };
         if out.converged {
@@ -297,6 +303,22 @@ impl<'g> CosetDecoder<'g> {
         res.piv_obs = pivot.obs_piv;
         res.piv_energy = pivot.en_piv;
         res.q_obs = pivot.obs_q;
+        res.piv_span = pivot.piv_span as u32;
+        res.amb_gap = pivot.amb_gap;
+        if smc_cfg.tau_ambig > 0 && pivot.amb_gap >= smc_cfg.tau_ambig {
+            // two-stage slow path: no logical-changing coordinate is within tau_ambig of the
+            // relaxed solution, so it is committed without sampling
+            res.obs = pivot.obs_q;
+            res.best_obs = pivot.obs_q;
+            res.mode_obs = pivot.obs_q;
+            res.marginal_obs = pivot.obs_q;
+            res.best_energy = pivot.en_q;
+            res.energy_gap = pivot.amb_gap;
+            res.min_abs_df = DELTA_F_CAP;
+            res.ess = smc_cfg.walkers as f64;
+            return res;
+        }
+        res.smc_sampled = true;
         let smc = run_smc(&pivot, g.n_obs, &self.cfg.smc, &self.tables, shot_id);
         // decision: the coset of largest total weight (smallest coset free energy)
         res.obs = smc.mode_obs;
@@ -405,6 +427,65 @@ mod tests {
         // these shots are intrinsically ambiguous (a weight-3 fault and its weight-3 logical
         // complement are equally likely), so escalation relocates rather than removes them
         assert!(gated_fail <= bare_fail + bare_fail / 10 + 2, "escalation cost accuracy: {gated_fail} vs {bare_fail}");
+    }
+
+    /// Two-stage slow path: sampling is skipped exactly when no logical-changing coordinate
+    /// lies within `tau_ambig` of the relaxed solution; that solution is then the answer, and
+    /// every other shot is decoded exactly as without the gate.
+    #[test]
+    fn two_stage_slow_path_skips_sampling_only_on_unambiguous_shots() {
+        let code = bb72().build().unwrap();
+        let g = TannerGraph::from_complex(&ChainComplex::from_css_x_errors(&code).unwrap());
+        let p = 0.03;
+        let llr = vec![llr_from_prob(p); g.n_var];
+        let en: Vec<i32> = llr.iter().map(|&l| energy_from_llr(l)).collect();
+        let tau = 48;
+        let smc = SmcConfig { k_cols: g.n_var, walkers: 64, beta_steps: 16, ..SmcConfig::default() };
+        let always = DecoderConfig { bp: BpConfig::default(), smc, esc: EscalationConfig::default() };
+        let gated = DecoderConfig { smc: SmcConfig { tau_ambig: tau, ..smc }, ..always };
+        let (dec_always, dec_gated) = (CosetDecoder::new(&g, always), CosetDecoder::new(&g, gated));
+        let mut work = DecodeWork::default();
+        let (mut slow, mut skipped, mut always_fail, mut gated_fail) = (0u32, 0u32, 0u32, 0u32);
+        let shots = 3000u32;
+        for shot in 0..shots {
+            let mut e = vec![0u64; g.n_var.div_ceil(64)];
+            for v in 0..g.n_var {
+                if uniform(shot as u64 + 4100, v) < p {
+                    e[v >> 6] ^= 1 << (v & 63);
+                }
+            }
+            let syn = g.syndrome_of(&e);
+            let truth = g.observables_of(&e);
+            let a = dec_always.decode(&mut work, &llr, &en, &syn, shot);
+            let b = dec_gated.decode(&mut work, &llr, &en, &syn, shot);
+            always_fail += (a.obs != truth) as u32;
+            gated_fail += (b.obs != truth) as u32;
+            assert_eq!((a.smc_ran, a.solvable), (b.smc_ran, b.solvable));
+            if !a.smc_ran || !a.solvable {
+                assert!(!a.smc_sampled && !b.smc_sampled && a.obs == b.obs);
+                assert_eq!((b.piv_span, b.amb_gap), (0, ESC_NONE));
+                continue;
+            }
+            slow += 1;
+            // the relaxation does not depend on the gate
+            assert_eq!((a.q_obs, a.piv_obs, a.piv_span, a.amb_gap, a.rank), (b.q_obs, b.piv_obs, b.piv_span, b.amb_gap, b.rank));
+            assert!(a.smc_sampled && b.piv_span >= b.rank && b.piv_span as usize <= g.n_var);
+            if b.smc_sampled {
+                assert!(b.amb_gap < tau);
+                assert_eq!(
+                    (a.obs, a.best_obs, a.best_energy, a.energy_gap, a.resamples, a.min_abs_df.to_bits(), a.ess.to_bits()),
+                    (b.obs, b.best_obs, b.best_energy, b.energy_gap, b.resamples, b.min_abs_df.to_bits(), b.ess.to_bits())
+                );
+            } else {
+                skipped += 1;
+                assert!(b.amb_gap >= tau);
+                assert_eq!((b.obs, b.best_obs, b.mode_obs, b.marginal_obs), (b.q_obs, b.q_obs, b.q_obs, b.q_obs));
+                assert_eq!((b.energy_gap, b.resamples, b.min_abs_df, b.hle), (b.amb_gap, 0, DELTA_F_CAP, false));
+            }
+        }
+        eprintln!("[two-stage] slow-path shots {slow}, sampling skipped {skipped}; failures always-sample={always_fail} gated={gated_fail}");
+        assert!(skipped >= 20 && slow - skipped >= 20, "both branches must be exercised ({skipped} skipped of {slow})");
+        assert!(gated_fail <= always_fail + always_fail / 10 + 2, "the gate cost accuracy: {gated_fail} vs {always_fail}");
     }
 
     /// Head-to-head of failure heralds on a BB72 space-time (phenomenological) detector error

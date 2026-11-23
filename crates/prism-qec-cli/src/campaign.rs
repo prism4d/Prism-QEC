@@ -12,8 +12,8 @@ use qec_core::fixed::PRIOR_CLIP;
 use qec_core::merkle::write_seal;
 use qec_cuda::{record_mismatch, GpuDecoder, GpuTelemetry, LaunchMode};
 use qec_neuro_dem::{
-    run_reference, run_reference_oracle, run_reference_with_weights, CanonicalDecoderConfig, PipelineConfig, ShotRecord,
-    StreamPlan, SEED_DOMAIN_BLIND,
+    is_blind_domain, run_reference, run_reference_oracle, run_reference_with_weights, CanonicalDecoderConfig, PipelineConfig,
+    ShotRecord, StreamPlan,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -190,8 +190,19 @@ fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseli
     let (mut pe, mut oe, mut le, mut wins, mut losses, mut wins_l, mut losses_l) = (0, 0, 0, 0u64, 0u64, 0u64, 0u64);
     let (mut fp_false, mut fast, mut esc, mut slow, mut unsolv, mut hle, mut khat_rej) = (0, 0, 0, 0, 0, 0, 0);
     let (mut f_forest, mut f_best, mut f_marg) = (0, 0, 0);
-    for (s, r) in dec.records.iter().enumerate() {
-        let r = &r.result;
+    let (mut sampled, mut armed_blocks, mut write_blocks, mut writes) = (0usize, 0usize, 0usize, 0u64);
+    let (mut max_iters, mut max_span, mut max_resamples) = (0u32, 0u32, 0u32);
+    // fast-path false convergences on which the baselines fail too / return the same class
+    let (mut fp_osd_wrong, mut fp_osd_same, mut fp_lsd_wrong) = (0usize, 0usize, 0usize);
+    for (s, rec) in dec.records.iter().enumerate() {
+        let r = &rec.result;
+        sampled += r.smc_sampled as usize;
+        armed_blocks += rec.report.armed as usize;
+        write_blocks += (rec.report.weight_writes > 0) as usize;
+        writes += rec.report.weight_writes as u64;
+        max_iters = max_iters.max(r.bp_iters);
+        max_span = max_span.max(r.piv_span);
+        max_resamples = max_resamples.max(r.resamples);
         let (p, o, l) = (fail(r.obs, s), fail(bposd.pred[s], s), fail(bplsd.pred[s], s));
         pe += p as usize;
         oe += o as usize;
@@ -201,7 +212,12 @@ fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseli
         wins_l += (!p && l) as u64;
         losses_l += (p && !l) as u64;
         fast += r.fast_accepted() as usize;
-        fp_false += (r.fast_accepted() && p) as usize;
+        if r.fast_accepted() && p {
+            fp_false += 1;
+            fp_osd_wrong += o as usize;
+            fp_osd_same += (bposd.pred[s] == r.obs) as usize;
+            fp_lsd_wrong += l as usize;
+        }
         esc += (r.esc_reason != 0) as usize;
         slow += r.smc_ran as usize;
         unsolv += (r.smc_ran && !r.solvable) as usize;
@@ -224,6 +240,10 @@ fn stationary_cell(ds: &Dataset, dec: &Decoded, bposd: &Baseline, bplsd: &Baseli
         "mcnemar_p_value_vs_bplsd": mcnemar_exact(losses_l, wins_l),
         "fast_path_accepted": fast, "fast_path_false_converged": fp_false, "fast_path_escalated": esc,
         "slow_path_shots": slow, "slow_path_unsolvable": unsolv, "hle_flagged": hle, "khat_rejected": khat_rej,
+        "fast_path_false_converged_attribution": {"bposd_also_wrong": fp_osd_wrong, "bposd_same_wrong_class": fp_osd_same, "bplsd_also_wrong": fp_lsd_wrong},
+        "path_counts": {"fast_path": fast, "osd_quench_exit": slow - unsolv - sampled, "full_smc": sampled, "unsolvable": unsolv},
+        "dem_registers": {"blocks": n, "blocks_armed": armed_blocks, "blocks_with_writes": write_blocks, "weight_writes": writes},
+        "worst_case_depth": {"bp_iterations": max_iters, "elimination_columns": max_span, "resampling_events": max_resamples},
         "alternative_decisions": {"forest_errors": f_forest, "min_energy_walker_errors": f_best, "bitwise_marginal_errors": f_marg},
         "bposd_bp_converged_fraction": bposd.summary["bp_converged_fraction"],
         "gpu": {"shots_per_sec": dec.telemetry.shots_per_sec, "wall_seconds": dec.telemetry.wall_seconds,
@@ -350,10 +370,18 @@ fn drift_dataset(
     let onset = ds.meta_usize("onset_block").unwrap_or(0);
     let mut reaction = Vec::new();
     let mut pre_surgery = 0usize;
+    // weight-register activity before / after the onset block: blocks, armed, with writes, writes
+    let mut reg = [[0u64; 4]; 2];
     for tr in 0..plan.streams {
         let mut first = None;
         for blk in 0..plan.steps {
-            let touched = on.records[plan.shot(tr, blk).unwrap_or(0)].report.modified_mechanisms > 0;
+            let rep = &on.records[plan.shot(tr, blk).unwrap_or(0)].report;
+            let side = &mut reg[(blk >= onset) as usize];
+            side[0] += 1;
+            side[1] += rep.armed as u64;
+            side[2] += (rep.weight_writes > 0) as u64;
+            side[3] += rep.weight_writes as u64;
+            let touched = rep.modified_mechanisms > 0;
             if blk < onset {
                 pre_surgery += touched as usize;
             } else if touched && first.is_none() {
@@ -377,6 +405,10 @@ fn drift_dataset(
         "prism_on_wins_bposd_fails": wins, "prism_on_fails_bposd_wins": losses, "mcnemar_p_value": mcnemar_exact(losses, wins),
         "monitor": {
             "traces_with_surgery": reaction.len(), "pre_onset_blocks_with_surgery": pre_surgery,
+            "dem_registers": {
+                "stationary_pre_onset": {"blocks": reg[0][0], "blocks_armed": reg[0][1], "blocks_with_writes": reg[0][2], "weight_writes": reg[0][3]},
+                "post_onset": {"blocks": reg[1][0], "blocks_armed": reg[1][1], "blocks_with_writes": reg[1][2], "weight_writes": reg[1][3]},
+            },
             "median_blocks_from_onset_block_to_first_surgery": median_blocks,
             "median_rounds_from_onset_to_first_surgery_upper_bound": median_blocks.map(|b| (b + 1) * rounds),
         },
@@ -490,15 +522,47 @@ fn latency_run(gpu: &mut GpuDecoder, ds: &Dataset, model: &DecodeModel, cfg: &Pi
     Ok((tel.launch_ns.clone(), tel))
 }
 
+/// Register, barrier and shared-memory use of every SM120 kernel, parsed from the assembler
+/// log embedded at build time, and the largest values.
+fn kernel_footprint() -> Value {
+    let mut kernels = Vec::new();
+    let (mut name, mut stack, mut spill) = (String::new(), 0u64, 0u64);
+    let (mut peak_reg, mut peak_smem) = (0u64, 0u64);
+    let num_before = |line: &str, key: &str| -> u64 {
+        line.find(key)
+            .and_then(|pos| line[..pos].split(|c: char| !c.is_ascii_digit()).rfind(|t| !t.is_empty()).map(str::to_string))
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0)
+    };
+    for line in qec_cuda::PTXAS_LOG.lines() {
+        if let Some(pos) = line.find("Compiling entry function '") {
+            let rest = &line[pos + "Compiling entry function '".len()..];
+            name = rest.split('\'').next().unwrap_or("").to_string();
+        } else if line.contains("bytes stack frame") {
+            stack = num_before(line, " bytes stack frame");
+            spill = num_before(line, " bytes spill stores");
+        } else if line.contains(" registers") && !name.is_empty() {
+            let (reg, bar, smem) = (num_before(line, " registers"), num_before(line, " barriers"), num_before(line, " bytes smem"));
+            peak_reg = peak_reg.max(reg);
+            peak_smem = peak_smem.max(smem);
+            kernels.push(json!({"kernel": name, "registers": reg, "barriers": bar, "shared_memory_bytes": smem,
+                                "stack_frame_bytes": stack, "spill_store_bytes": spill}));
+            name.clear();
+        }
+    }
+    json!({"kernels": kernels, "peak_registers_per_thread": peak_reg, "peak_shared_memory_bytes_per_block": peak_smem})
+}
+
 /// Non-unblinding device audit of one calibration or smoke dataset: GPU/CPU parity on a shot
 /// prefix, runtime telemetry, batch throughput and per-shot streaming latency against the
 /// baseline decoders' recorded latencies (when the dataset has baselines).
 pub fn audit(ds_dir: &Path, frozen: &CanonicalDecoderConfig, parity_shots: usize, latency_shots: usize) -> Result<Value> {
     let ds = Dataset::load(ds_dir)?;
     ensure!(
-        ds.seed_domain() != SEED_DOMAIN_BLIND,
-        "'{}' is a {SEED_DOMAIN_BLIND} dataset: the device audit never decodes blind shots",
-        ds.name
+        !is_blind_domain(ds.seed_domain()),
+        "'{}' is a {} dataset: the device audit never decodes blind shots",
+        ds.name,
+        ds.seed_domain()
     );
     let model = DecodeModel::build(&ds.dem, frozen.cycle_search(), &frozen.neuro())?;
     let cfg = frozen.pipeline(ds.dem.n_det, ds.dem.n_err(), true);
@@ -557,10 +621,16 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(args.root.join("oracle_manifest.json"))?)?;
     let domain = manifest["seed_domain"].as_str().context("manifest without seed_domain")?.to_string();
     ensure!(domain != qec_neuro_dem::SEED_DOMAIN_CALIB, "the calibration domain must not be evaluated as a campaign");
-    if domain == SEED_DOMAIN_BLIND {
-        ensure!(args.release_blind, "{SEED_DOMAIN_BLIND} is quarantined: pass --release-blind once the frozen configuration is final");
+    if is_blind_domain(&domain) {
+        ensure!(args.release_blind, "{domain} is quarantined: pass --release-blind once the frozen configuration is final");
+        ensure!(
+            domain == frozen.blind_domain(),
+            "{} may only be evaluated on {}: {domain} belongs to another configuration (a spent holdout is never re-used)",
+            frozen.config_id(),
+            frozen.blind_domain()
+        );
     } else {
-        println!("[campaign] NOTE: evaluating seed domain {domain}, not {SEED_DOMAIN_BLIND}");
+        println!("[campaign] NOTE: evaluating seed domain {domain}, not a blind holdout");
     }
     let names: Vec<String> = manifest["datasets"].as_array().context("manifest without datasets")?.iter().filter_map(|v| v.as_str().map(String::from)).collect();
     let mut gpu = GpuDecoder::new(6usize << 30, 64 << 20)?;
@@ -656,6 +726,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             let fp = c["fast_path_false_converged"].as_u64().unwrap_or(0);
             json!({
                 "p": c["p"], "prism_errors": pe, "bposd_errors": oe, "fast_path_false_converged": fp,
+                "fast_path_false_converged_attribution": c["fast_path_false_converged_attribution"],
                 "false_convergence_within_bound": pe == 0 || fp <= 3.max((0.12 * pe as f64) as u64),
                 "no_significant_regression_vs_bposd": !(pe > oe && c["mcnemar_p_value"].as_f64().unwrap_or(1.0) < 0.05),
             })
@@ -676,8 +747,13 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             "calibration_datasets": match frozen.version {
                 0 | 1 => json!(["bb72 p=0.002", "surface_d5 p=0.002"]),
                 2 => json!(["bb72 p=0.002", "surface_d5 p=0.002", "bb72 p=0.0015 drift tls (400 traces)", "bb72 p=0.0015 drift xtburst (400 traces)"]),
-                _ => json!([
+                3 | 4 => json!([
                     "bb72 p=0.002", "surface_d5 p=0.002", "bb144_gross p=0.003", "hgp_hamming p=0.002",
+                    "bb72 and bb144_gross p=0.0015 drift tls / xtburst (drift profile 2, 400 traces each)"
+                ]),
+                _ => json!([
+                    "bb72 p=0.001 and p=0.002", "surface_d5 p=0.001 and p=0.002", "bb144_gross p=0.003",
+                    "hgp_hamming p=0.001 and p=0.002",
                     "bb72 and bb144_gross p=0.0015 drift tls / xtburst (drift profile 2, 400 traces each)"
                 ]),
             },
@@ -697,6 +773,17 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
             "p50_us": lat["p50_us"], "p99_us": lat["p99_us"], "p999_us": lat["p999_us"], "mean_us": lat["mean_us"],
             "shots_per_sec": headline["batch_shots_per_sec"],
             "speedup_vs_bposd": headline["mean_latency_speedup_vs_bposd"],
+            "speedup_vs_bplsd": headline["mean_latency_speedup_vs_bplsd"],
+            "bposd_cpu_single_thread": headline["bposd_cpu_single_thread"],
+            "bplsd_cpu_single_thread": headline["bplsd_cpu_single_thread"],
+            "kernel_footprint": kernel_footprint(),
+            "sequential_depth_bounds": {
+                "bp_iterations": frozen.t_max,
+                "relaxation_quenches": frozen.pair_rounds + 1, "quench_sweeps_each": frozen.quench_sweeps,
+                "pair_evaluations_per_round": frozen.pair_lambda * frozen.pair_lambda.saturating_sub(1) / 2,
+                "smc_annealing_steps": frozen.beta_steps * frozen.sweeps,
+                "elimination_pivots": "rank of d1 per code; columns visited are reported per cell under worst_case_depth",
+            },
             "batch_throughput_speedup_vs_bposd_single_thread": headline["batch_throughput_speedup_vs_bposd_single_thread"],
             "headline_cell": headline["dataset"],
             "latency_definition": "wall time from graph launch to its single terminal wait, one stream, one shot per launch",
@@ -719,6 +806,7 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         "baselines": manifest["baseline_config"],
         "disclosures": [
             "Decoder design and early parameter exploration used development shots of bb72 and bb144_gross at p = 0.003 (dev seed, disjoint from both seed domains) before the protocol was adopted; FROZEN_V1 values were then set on CALIB_2026 only.",
+            "FROZEN_V5 = FROZEN_V4 plus a drift alarm that arms the weight registers, a register deadband and a two-stage slow path that skips sampling when the relaxed solution is unambiguous. It was developed after FROZEN_V4 had been evaluated on BLIND_HOLDOUT_2026; that domain is spent and was not used. FROZEN_V5 was set on CALIB_2026 only and may only be evaluated on BLIND_HOLDOUT_V5_2026.",
             "FROZEN_V4 = FROZEN_V3 plus the herald with solution weight per check; decoder, monitor and kernels are unchanged. It was set on CALIB_2026 only, with no blind shot decoded. On the CALIB_2026 crosstalk-plus-burst sets the monitor reached 2.76x (bb72) and 4.3x (bb144_gross) over static BP-OSD, 3.06x pooled; three monitor variants built to raise that (pooled fast amplitude, hot-region prior, shorter windows) moved it by 3% or less and were not adopted.",
             "FROZEN_V3 = FROZEN_V2 plus the full-column pivot. It was developed after FROZEN_V2 lost to BP-OSD on bb144_gross development shots; its new values and every inherited value were validated on CALIB_2026 only (bb72, surface_d5, bb144_gross, hgp_hamming). The drift generator (profile 2) was re-scaled on CALIB_2026 so that static BP-OSD has a usable error floor on bb144_gross before any blind drift set was generated.",
             "FROZEN_V2 was developed after FROZEN_V1 had been measured on CALIB_2026 and SMOKE_2026 shots (bb72, bb144_gross, surface_d5, hgp_hamming); its values were chosen on CALIB_2026 and cross-checked on SMOKE_2026. No PRISM decode of a BLIND_HOLDOUT_2026 shot took place before the configuration was frozen; the CLI refuses blind datasets outside this campaign.",
@@ -735,4 +823,30 @@ pub fn run(args: &CampaignArgs) -> Result<()> {
         bail!("GPU and CPU reference disagree on {parity_mismatches} of {parity_shots} compared shots");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The receipt's kernel footprint comes from the assembler log of the embedded module:
+    /// every entry function is listed, none has a stack frame or a register spill.
+    #[test]
+    fn kernel_footprint_lists_every_entry_function_without_spill() {
+        let fp = kernel_footprint();
+        let kernels = fp["kernels"].as_array().unwrap();
+        assert_eq!(kernels.len(), qec_cuda::PTXAS_LOG.matches("Compiling entry function").count());
+        for name in ["qec_neuro_update", "qec_bp_decode", "qec_slow_gate", "qec_smc_decode"] {
+            assert!(kernels.iter().any(|k| k["kernel"] == name), "{name} missing from the footprint");
+        }
+        let mut peak = 0;
+        for k in kernels {
+            let reg = k["registers"].as_u64().unwrap();
+            assert!((1..=255).contains(&reg), "{k}");
+            assert_eq!((k["stack_frame_bytes"].as_u64(), k["spill_store_bytes"].as_u64()), (Some(0), Some(0)), "{k}");
+            peak = peak.max(reg);
+        }
+        assert_eq!(fp["peak_registers_per_thread"].as_u64(), Some(peak));
+        assert!(fp["peak_shared_memory_bytes_per_block"].as_u64().unwrap() > 0);
+    }
 }

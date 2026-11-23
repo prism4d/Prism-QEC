@@ -106,6 +106,9 @@ pub struct DecodeStats {
     /// Accepted fast paths whose logical class is wrong.
     pub fast_path_false_converged: usize,
     pub slow_path_shots: usize,
+    /// Slow-path shots that ran the sampler, and those committed after the relaxation alone.
+    pub slow_path_sampled: usize,
+    pub slow_path_quench_exit: usize,
     pub unsolvable: usize,
     pub hle_flagged: usize,
     pub khat_rejected: usize,
@@ -153,6 +156,8 @@ pub fn stats(ds: &Dataset, results: &[ShotResult], decision: Decision, khat_max:
         cu += r.check_updates;
         if r.smc_ran {
             st.slow_path_shots += 1;
+            st.slow_path_sampled += r.smc_sampled as usize;
+            st.slow_path_quench_exit += (r.solvable && !r.smc_sampled) as usize;
             st.unsolvable += !r.solvable as usize;
             st.hle_flagged += r.hle as usize;
             st.khat_rejected += (r.solvable && r.khat > khat_max) as usize;
@@ -269,6 +274,9 @@ pub fn records_digest(results: &[ShotResult]) -> String {
             r.esc_reason as u64,
             r.esc_margin as u64,
             r.esc_gap as u64,
+            r.piv_span as u64,
+            r.amb_gap as u64,
+            r.smc_sampled as u64,
             (r.bp_converged as u64) | ((r.smc_ran as u64) << 1) | ((r.solvable as u64) << 2),
         ] {
             h.update(&v.to_le_bytes());
@@ -293,19 +301,25 @@ pub fn dump_csv(
         w,
         "shot,truth,obs,bp_obs,piv_obs,q_obs,best_obs,mode_obs,marginal_obs,bp_converged,bp_iters,bp_unsat,esc_reason,\
          smc_ran,solvable,rank,n_free,piv_energy,best_energy,energy_gap,mode_free_energy,min_abs_df,khat,ess,bp_min_abs,\
-         resamples,damped_steps,modified,hot_checks,esc_margin,esc_gap,confidence"
+         resamples,damped_steps,modified,hot_checks,esc_margin,esc_gap,confidence,\
+         piv_span,amb_gap,smc_sampled,weight_writes,armed"
     )?;
     for (s, rec) in records.iter().enumerate() {
         let r = &rec.result;
-        writeln!(
-            w,
-            "{s},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            ds.truth(s), r.obs, r.bp_obs, r.piv_obs, r.q_obs, r.best_obs, r.mode_obs, r.marginal_obs, r.bp_converged as u8,
-            r.bp_iters, r.bp_unsat, r.esc_reason, r.smc_ran as u8, r.solvable as u8, r.rank, r.n_free, r.piv_energy,
-            r.best_energy, r.energy_gap, r.mode_free_energy, r.min_abs_df, r.khat, r.ess, r.bp_min_abs, r.resamples,
-            r.damped_steps, rec.report.modified_mechanisms, rec.report.hot_checks, r.esc_margin, r.esc_gap,
-            r.herald_confidence(hle_mode, khat_max, n_chk)
-        )?;
+        let fields: Vec<String> = vec![
+            s.to_string(), ds.truth(s).to_string(), r.obs.to_string(), r.bp_obs.to_string(), r.piv_obs.to_string(),
+            r.q_obs.to_string(), r.best_obs.to_string(), r.mode_obs.to_string(), r.marginal_obs.to_string(),
+            (r.bp_converged as u8).to_string(), r.bp_iters.to_string(), r.bp_unsat.to_string(), r.esc_reason.to_string(),
+            (r.smc_ran as u8).to_string(), (r.solvable as u8).to_string(), r.rank.to_string(), r.n_free.to_string(),
+            r.piv_energy.to_string(), r.best_energy.to_string(), r.energy_gap.to_string(), r.mode_free_energy.to_string(),
+            r.min_abs_df.to_string(), r.khat.to_string(), r.ess.to_string(), r.bp_min_abs.to_string(), r.resamples.to_string(),
+            r.damped_steps.to_string(), rec.report.modified_mechanisms.to_string(), rec.report.hot_checks.to_string(),
+            r.esc_margin.to_string(), r.esc_gap.to_string(), r.herald_confidence(hle_mode, khat_max, n_chk).to_string(),
+            r.piv_span.to_string(),
+            r.amb_gap.to_string(), (r.smc_sampled as u8).to_string(), rec.report.weight_writes.to_string(),
+            rec.report.armed.to_string(),
+        ];
+        writeln!(w, "{}", fields.join(","))?;
     }
     w.flush()
 }

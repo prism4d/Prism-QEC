@@ -98,6 +98,11 @@ pub struct Pivot {
     pub obs_q: u64,
     /// Twist field: energy change of toggling cycle `t` at the quenched state, clipped.
     pub theta: Vec<i32>,
+    /// Columns the elimination had to visit: list position after the last pivot.
+    pub piv_span: usize,
+    /// Ambiguity gap: smallest (clipped) energy change, at the relaxed state, of a free
+    /// coordinate whose cycle changes the logical class; `i32::MAX` if no such coordinate.
+    pub amb_gap: i32,
 }
 
 /// Scratch reused across shots.
@@ -250,9 +255,10 @@ fn build_pivot_mode(
     let mut piv_col = vec![-1i32; n_chk];
     let mut is_free = vec![true; k];
     let mut rank = 0usize;
+    let mut piv_span = 0usize;
     for j in 0..k {
-        if rank == n_chk {
-            break; // every row has its pivot: all remaining columns are non-pivot
+        if rank == g.h_rank {
+            break; // the rank of d1 is reached: all remaining columns are non-pivot
         }
         let (w, m) = (j >> 6, 1u64 << (j & 63));
         let mut pr = usize::MAX;
@@ -269,6 +275,7 @@ fn build_pivot_mode(
         piv_col[pr] = j as i32;
         is_free[j] = false;
         rank += 1;
+        piv_span = j + 1;
         let (lo, hi) = scratch.mat.split_at_mut(pr * wm);
         let (prow, hi) = hi.split_at_mut(wm);
         for other in lo.chunks_exact_mut(wm).chain(hi.chunks_exact_mut(wm)) {
@@ -388,6 +395,8 @@ fn build_pivot_mode(
         en_q: 0,
         obs_q: 0,
         theta: Vec::new(),
+        piv_span,
+        amb_gap: i32::MAX,
     };
     pivot.relax(relax);
     pivot
@@ -476,6 +485,7 @@ impl Pivot {
         self.theta = (0..n_free)
             .map(|t| self.delta_energy(t, &st.rows, (st.z[t >> 6] >> (t & 63)) & 1 == 1).clamp(-TWIST_CLIP, TWIST_CLIP))
             .collect();
+        self.amb_gap = (0..n_free).filter(|&t| self.cyc_obs[t] != 0).map(|t| self.theta[t]).min().unwrap_or(i32::MAX);
         self.zq = st.z;
         self.rows_q = st.rows;
         self.en_q = st.energy;

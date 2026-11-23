@@ -109,10 +109,15 @@ fn out_to_record(o: &QecShotOut) -> ShotRecord {
             bp_min_abs: o.bp_min_abs,
             resamples: o.resamples as u32,
             hle: o.hle != 0,
+            piv_span: o.piv_span as u32,
+            amb_gap: o.amb_gap,
+            smc_sampled: o.smc_sampled != 0,
         },
         report: BlockReport {
             hot_checks: o.hot_checks as u32,
             modified_mechanisms: o.modified_mechanisms as u32,
+            weight_writes: o.weight_writes as u32,
+            armed: o.armed as u32,
             ..BlockReport::default()
         },
         latency_ns: 0,
@@ -237,6 +242,7 @@ impl GpuDecoder {
         p.explained = rt.alloc_zeroed(streams * n_pairs * 4)?;
         p.cls_cnt = rt.alloc_zeroed((streams * n_cls * 2).max(8))?;
         p.cls_rate = rt.alloc_zeroed((streams * n_cls * 4).max(8))?;
+        p.arm_state = rt.alloc_zeroed(streams * 16)?;
         // live DEM weights of every stream, contiguous: the persisting-L2 window
         let en_nom: Vec<i32> = layout.llr_nom.iter().map(|&l| qec_core::fixed::energy_from_llr(l)).collect();
         let mut live = Vec::with_capacity(streams * n_var);
@@ -296,6 +302,8 @@ impl GpuDecoder {
         p.w_lw = rt.alloc(sb * (2 * walkers + 128) * 8)?;
         // ---- scalars
         p.seed_smc = dc.smc.seed;
+        p.blk_mu_q8 = layout.blk_mu_q8;
+        p.blk_sigma_q8 = layout.blk_sigma_q8;
         p.hazard = cfg.neuro.hazard;
         p.hot_on = cfg.neuro.hot_on;
         p.hot_off = cfg.neuro.hot_off;
@@ -321,6 +329,7 @@ impl GpuDecoder {
         p.wz = wz as u32;
         p.k_cols = k_cols as u32;
         p.k_list = k_list as u32;
+        p.h_rank = g.h_rank as u32;
         p.walkers = walkers as u32;
         p.smc_blocks = smc_blocks;
         p.t_max = dc.bp.t_max as i32;
@@ -339,6 +348,7 @@ impl GpuDecoder {
         p.pair_lambda = dc.smc.pair_lambda as i32;
         p.pair_rounds = dc.smc.pair_rounds as i32;
         p.full_columns = full as i32;
+        p.tau_ambig = dc.smc.tau_ambig;
         p.resample_q8 = dc.smc.resample_q8 as i32;
         p.tanh_max = TANH_MAX;
         p.twist_clip = TWIST_CLIP;
@@ -354,6 +364,10 @@ impl GpuDecoder {
         p.coin_min = cfg.neuro.coin_min as i32;
         p.g_threshold_coin = cfg.neuro.g_threshold_coin as i32;
         p.coin_snap = cfg.neuro.snap as i32;
+        p.arm_h_q8 = cfg.neuro.arm_h_q8 as i32;
+        p.arm_kappa_q8 = cfg.neuro.arm_kappa_q8 as i32;
+        p.arm_calm = cfg.neuro.arm_calm as i32;
+        p.llr_deadband = cfg.neuro.llr_deadband;
         p.f2_engine = self.f2_engine;
         p.steps_per_launch = match mode {
             LaunchMode::Batch => 0,
@@ -456,17 +470,23 @@ pub fn record_mismatch(cpu: &ShotRecord, gpu: &ShotRecord, tol: f64) -> Option<S
     }
     exact!(
         obs, bp_converged, bp_iters, bp_unsat, damped_steps, damped_mask, bp_obs, esc_reason, esc_margin, esc_gap, smc_ran, solvable, rank, n_free, piv_obs,
-        piv_energy, best_energy, best_obs, q_obs, mode_obs, marginal_obs, energy_gap, bp_min_abs, resamples
+        piv_energy, best_energy, best_obs, q_obs, mode_obs, marginal_obs, energy_gap, bp_min_abs, resamples, piv_span, amb_gap,
+        smc_sampled
     );
     let close = |x: f64, y: f64| (x == y) || (x - y).abs() <= tol * (1.0 + x.abs().min(y.abs()));
     macro_rules! approx {
         ($($f:ident),*) => { $( if !close(a.$f, b.$f) { return Some(format!("{}: cpu {} gpu {}", stringify!($f), a.$f, b.$f)); } )* };
     }
     approx!(khat, min_abs_df, ess, mode_free_energy);
-    if cpu.report.modified_mechanisms != gpu.report.modified_mechanisms || cpu.report.hot_checks != gpu.report.hot_checks {
+    if cpu.report.modified_mechanisms != gpu.report.modified_mechanisms
+        || cpu.report.hot_checks != gpu.report.hot_checks
+        || cpu.report.weight_writes != gpu.report.weight_writes
+        || cpu.report.armed != gpu.report.armed
+    {
         return Some(format!(
-            "monitor: cpu modified={} hot={} gpu modified={} hot={}",
-            cpu.report.modified_mechanisms, cpu.report.hot_checks, gpu.report.modified_mechanisms, gpu.report.hot_checks
+            "monitor: cpu modified={} hot={} writes={} armed={} gpu modified={} hot={} writes={} armed={}",
+            cpu.report.modified_mechanisms, cpu.report.hot_checks, cpu.report.weight_writes, cpu.report.armed,
+            gpu.report.modified_mechanisms, gpu.report.hot_checks, gpu.report.weight_writes, gpu.report.armed
         ));
     }
     None
