@@ -97,6 +97,16 @@ enum Cmd {
         #[arg(long)]
         flooding: bool,
     },
+    /// Device audit of a calibration or smoke dataset (never a blind one): GPU/CPU parity,
+    /// runtime telemetry, batch throughput and per-shot streaming latency (requires the GPU lease).
+    GpuAudit {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        parity_shots: usize,
+        #[arg(long, default_value_t = 1000)]
+        latency_shots: usize,
+    },
     /// Seal a directory with the dual SHA-256 + BLAKE3 Merkle tree.
     Seal {
         #[arg(long)]
@@ -404,6 +414,10 @@ fn main() -> Result<()> {
                 "gpu_parity shots={} mismatches={bad} host_syncs_in_decode_loop={} integrity={} graph_mode={}",
                 cpu.len(), tel.host_syncs_in_decode_loop, tel.f2_integrity_errors, tel.graph_mode
             );
+        }
+        Cmd::GpuAudit { dataset, parity_shots, latency_shots } => {
+            let report = campaign::audit(&dataset, &frozen, parity_shots, latency_shots)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Cmd::Seal { root } => {
             let seal = qec_core::merkle::write_seal(&root, &utc_now())?;

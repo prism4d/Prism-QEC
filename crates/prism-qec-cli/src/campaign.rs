@@ -490,6 +490,68 @@ fn latency_run(gpu: &mut GpuDecoder, ds: &Dataset, model: &DecodeModel, cfg: &Pi
     Ok((tel.launch_ns.clone(), tel))
 }
 
+/// Non-unblinding device audit of one calibration or smoke dataset: GPU/CPU parity on a shot
+/// prefix, runtime telemetry, batch throughput and per-shot streaming latency against the
+/// baseline decoders' recorded latencies (when the dataset has baselines).
+pub fn audit(ds_dir: &Path, frozen: &CanonicalDecoderConfig, parity_shots: usize, latency_shots: usize) -> Result<Value> {
+    let ds = Dataset::load(ds_dir)?;
+    ensure!(
+        ds.seed_domain() != SEED_DOMAIN_BLIND,
+        "'{}' is a {SEED_DOMAIN_BLIND} dataset: the device audit never decodes blind shots",
+        ds.name
+    );
+    let model = DecodeModel::build(&ds.dem, frozen.cycle_search(), &frozen.neuro())?;
+    let cfg = frozen.pipeline(ds.dem.n_det, ds.dem.n_err(), true);
+    let plan = ds.plan(256, Some(parity_shots));
+    let mut gpu = GpuDecoder::new(6usize << 30, 64 << 20)?;
+    gpu.smc_blocks = 448;
+    let f2 = gpu.f2_microbench(944, 128, 1024, 200)?;
+    let dec = decode_with_parity(&mut gpu, &ds, &model, &cfg, &plan, plan.n_shots)?;
+    let mean = |v: &[u64]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
+    let slow = dec.records.iter().filter(|r| r.result.smc_ran).count();
+    let mut out = json!({
+        "dataset": ds.name, "seed_domain": ds.seed_domain(), "config_id": frozen.config_id(), "config_sha256": frozen.sha256(),
+        "gpu_vs_cpu_parity": {"shots_compared": dec.parity_shots, "mismatches": dec.parity_mismatches, "first_mismatch": dec.first_mismatch},
+        "batch": {
+            "shots": plan.n_shots, "slow_path_shots": slow, "shots_per_sec": dec.telemetry.shots_per_sec,
+            "wall_seconds": dec.telemetry.wall_seconds, "host_syncs_in_decode_loop": dec.telemetry.host_syncs_in_decode_loop,
+            "fast_loop_iterations": dec.telemetry.fast_loop_iterations, "slow_loop_iterations": dec.telemetry.slow_loop_iterations,
+            "f2_integrity_errors": dec.telemetry.f2_integrity_errors, "graph_mode": dec.telemetry.graph_mode,
+            "arena_used_bytes": dec.telemetry.arena_used_bytes,
+        },
+        "f2_engine_microbench": f2,
+    });
+    let n_obs = ds.dem.n_obs;
+    let bposd = load_baseline(ds_dir, "bposd", n_obs).ok();
+    let bplsd = load_baseline(ds_dir, "bplsd", n_obs).ok();
+    if let Some(b) = &bposd {
+        out["batch"]["throughput_speedup_vs_bposd_single_thread"] = json!(dec.telemetry.shots_per_sec * mean(&b.lat_ns) / 1e9);
+    }
+    if latency_shots > 0 {
+        let (ns, tel) = latency_run(&mut gpu, &ds, &model, &cfg, latency_shots)?;
+        let mut lat = json!({
+            "prism_gpu_streaming": latency_json(&ns), "launches": tel.launches,
+            "host_syncs_in_decode_loop": tel.host_syncs_in_decode_loop,
+        });
+        for (key, base) in [("bposd", &bposd), ("bplsd", &bplsd)] {
+            if let Some(b) = base {
+                let prefix = &b.lat_ns[..ns.len().min(b.lat_ns.len())];
+                lat[format!("{key}_cpu_single_thread")] = latency_json(prefix);
+                lat[format!("mean_latency_speedup_vs_{key}")] = json!(mean(prefix) / mean(&ns));
+            }
+        }
+        out["streaming_latency"] = lat;
+    }
+    let info = gpu.info();
+    out["green_ctx_sms"] = json!([info.sm_fast, info.sm_slow]);
+    out["device"] = json!({
+        "name": info.device_name(), "sm_total": info.sm_total, "sm_split_request": info.split_mode, "graph_mode": info.graph_mode,
+        "persisting_l2": {"device_max_bytes": info.l2_max_persist, "context_limit_bytes": info.l2_limit, "window_bytes": info.l2_window_bytes,
+                          "node_attribute_status": info.l2_attr_status, "node_attribute_readback_persisting": info.l2_attr_readback == 1},
+    });
+    Ok(out)
+}
+
 pub fn run(args: &CampaignArgs) -> Result<()> {
     let frozen = args.frozen;
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(args.root.join("oracle_manifest.json"))?)?;
