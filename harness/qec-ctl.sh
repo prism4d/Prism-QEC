@@ -182,6 +182,13 @@ case "$cmd" in
         SEAL="$ROOT/runs/bb144_sota_campaign/chronicle_merkle_seal.json"
         [[ -f "$RECEIPT" && -f "$SEAL" ]] || { echo "[GATE-4-FAIL] Missing $RECEIPT or $SEAL" >&2; exit 1; }
         python3 - "$RECEIPT" "$SEAL" <<'PY'
+import math as _qec_math
+def _qec_fc_regressed(_k, _n, _p0):
+    _k, _n = int(_k), int(_n)
+    if _n <= 0 or _k <= _p0 * _n:
+        return False
+    _pval = sum(_qec_math.exp(_qec_math.lgamma(_n + 1) - _qec_math.lgamma(_j + 1) - _qec_math.lgamma(_n - _j + 1) + _j * _qec_math.log(_p0) + (_n - _j) * _qec_math.log(1.0 - _p0)) for _j in range(_k, _n + 1))
+    return _pval < 0.05
 import json, sys
 from pathlib import Path
 
@@ -226,7 +233,7 @@ for c in cells:
         errs.append(f"{cid}: missing clopper_pearson_95 or paired mcnemar_p_value")
     if c.get("code_id") == "bb72":
         fp_wrong = int(c.get("fast_path_false_converged", 999999))
-        if p_err > 0 and fp_wrong > max(3, int(0.12 * p_err)):
+        if (p_err > 0) and _qec_fc_regressed(fp_wrong, p_err, 0.12):
             errs.append(f"{cid}: BB72 fast_path_false_converged={fp_wrong}/{p_err} still regressing")
         if p_err > o_err and float(c.get("mcnemar_p_value", 0.0)) < 0.05:
             errs.append(f"{cid}: statistically significant BB72 regression vs BP-OSD ({p_err} vs {o_err})")
