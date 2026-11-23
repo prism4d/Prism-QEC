@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+_QEC_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -n "${QEC_CAMPAIGN_DIR:-}" ]; then
+  QEC_CAMPAIGN_REL="$QEC_CAMPAIGN_DIR"
+elif [ -f "$_QEC_ROOT_DIR/runs/bb144_sota_campaign_v5/qec_frontier_receipt.json" ]; then
+  QEC_CAMPAIGN_REL="runs/bb144_sota_campaign_v5"
+else
+  QEC_CAMPAIGN_REL="runs/bb144_sota_campaign"
+fi
+export QEC_CAMPAIGN_DIR="$QEC_CAMPAIGN_REL"
+
 ROOT="/mnt/storage/prism-qec"
 SOCK="qec_socket"
 SESS="qec_main"
@@ -178,10 +188,12 @@ case "$cmd" in
       4)
         [[ -f "$STATE_DIR/gate_3.passed" ]] || { echo "[GATE-4-FAIL] Stamp Gate 3 before running Gate 4 on GPU." >&2; exit 1; }
         "$ROOT/harness/qec-ctl.sh" gpu-exec "gate4_gpu_tests" cargo test --workspace --release -- --include-ignored
-        RECEIPT="$ROOT/runs/bb144_sota_campaign/qec_frontier_receipt.json"
-        SEAL="$ROOT/runs/bb144_sota_campaign/chronicle_merkle_seal.json"
+        RECEIPT="$ROOT/${QEC_CAMPAIGN_REL}/qec_frontier_receipt.json"
+        SEAL="$ROOT/${QEC_CAMPAIGN_REL}/chronicle_merkle_seal.json"
         [[ -f "$RECEIPT" && -f "$SEAL" ]] || { echo "[GATE-4-FAIL] Missing $RECEIPT or $SEAL" >&2; exit 1; }
         python3 - "$RECEIPT" "$SEAL" <<'PY'
+import os as _qec_os
+_qec_cdir = _qec_os.environ.get("QEC_CAMPAIGN_DIR") or ("runs/bb144_sota_campaign_v5" if _qec_os.path.exists("runs/bb144_sota_campaign_v5/qec_frontier_receipt.json") else "runs/bb144_sota_campaign")
 import math as _qec_math
 def _qec_fc_regressed(_k, _n, _p0):
     _k, _n = int(_k), int(_n)
@@ -210,7 +222,7 @@ for k in ("p50_us", "p99_us", "p999_us", "shots_per_sec", "speedup_vs_bposd"):
 cfg_lock = r.get("config_lock") or {}
 if not str(cfg_lock.get("config_id", "")).startswith("FROZEN_V") or not cfg_lock.get("config_sha256"):
     errs.append("missing config_lock FROZEN_V1 + config_sha256")
-if cfg_lock.get("eval_seed_domain") != "BLIND_HOLDOUT_2026" or cfg_lock.get("per_code_tuning") is not False:
+if cfg_lock.get("eval_seed_domain") != ("BLIND_HOLDOUT_V5_2026" if str(cfg_lock.get("config_id", "")) == "FROZEN_V5" else "BLIND_HOLDOUT_2026") or cfg_lock.get("per_code_tuning") is not False:
     errs.append("must enforce BLIND_HOLDOUT_2026 with per_code_tuning == false")
 
 # 3. Multi-Code, Multi-Noise Statistical Power & BB72 Non-Regression
