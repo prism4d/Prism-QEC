@@ -8,3 +8,18 @@ __pycache__/
 *.pyc
 *.cubin
 *.fatbin
+
+# --- PRISM-QEC Hardened Exclusions ---
+target/
+**/*.rs.bk
+.env
+.env.*
+*.pem
+*.key
+*id_rsa*
+*id_ed25519*
+*credentials*.json
+.DS_Store
+*.swp
+*.swo
+.pytest_cache/
