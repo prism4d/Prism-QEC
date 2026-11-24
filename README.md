@@ -4,6 +4,9 @@
 **Deterministic GPU-Accelerated Quantum Error Correction, Non-Equilibrium Syndrome Decoding & Hardware Verification (`sm_120`)**  
 **Author / Architect:** Ididia J. Serfaty (`is@delfictus.com`) — Delfictus IO Inc.
 
+
+> **`FROZEN_V5` (`feat/v5-realtime-silicon`) Active Baseline:** Two-stage slow-path gating, $5\sigma$ deadband drift monitoring, dependent-column-skipping elimination, and `bb72` ML-coset verification are live in this tree. See [`docs/V4_TO_V5_RESOLUTION_MATRIX.md`](docs/V4_TO_V5_RESOLUTION_MATRIX.md) for why historical Gate-4 (`FROZEN_V4`) notes in archived receipts no longer apply.
+
 ---
 
 ## 1. Overview
